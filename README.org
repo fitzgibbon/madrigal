@@ -4,7 +4,6 @@
 This is a read-only GitHub mirror of the [[https://nest.pijul.com/fitzgibbon/madrigal][upstream repository on Pijul Nest]].
 #+end_quote
 
-
 Madrigal lets an LLM operate a live Emacs rather than merely describe what you
 could do yourself. It works from a focused, mode-aware view of the current
 buffer and keeps requests asynchronous so you can continue working.
