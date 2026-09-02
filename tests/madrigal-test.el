@@ -30,6 +30,50 @@
         (madrigal-agent-models '(("assistant" . ("Missing" . "agent-model")))))
     (should-error (madrigal-make-session "assistant") :type 'user-error)))
 
+(ert-deftest madrigal-agent-controller-mcp-context-is-optional ()
+  (let ((mcp-hub-servers '(("playwright" :command "secret-command"))))
+    (cl-letf (((symbol-function 'madrigal-agent-controller--mcp-available-p)
+               (lambda () nil)))
+      (should-not (madrigal-agent-controller--mcp-context "assistant"))))
+  (let ((mcp-hub-servers nil))
+    (cl-letf (((symbol-function 'madrigal-agent-controller--mcp-available-p)
+               (lambda () t)))
+      (should-not (madrigal-agent-controller--mcp-context "assistant")))))
+
+(ert-deftest madrigal-agent-controller-mcp-context-lists-only-server-names ()
+  (let ((mcp-hub-servers
+         '(("playwright" :command "secret-command" :env (:token "secret"))
+           ("github" :url "https://secret.invalid" :headers (:authorization "secret")))))
+    (cl-letf (((symbol-function 'madrigal-agent-controller--mcp-available-p)
+               (lambda () t)))
+      (let ((context (madrigal-agent-controller--mcp-context "assistant")))
+        (should (string-prefix-p
+                 "MCP is available through eval via mcp.el. Configured mcp-hub servers: "
+                 context))
+        (should (string-match-p "playwright, github" context))
+        (should (string-match-p "use the playwright MCP server" context))
+        (dolist (secret '("secret-command" "secret.invalid" "authorization" "token"))
+          (should-not (string-match-p secret context)))))))
+
+(ert-deftest madrigal-agent-controller-mcp-context-is-agent-specific-and-live ()
+  (cl-letf (((symbol-function 'madrigal-agent-controller--mcp-available-p)
+             (lambda () t)))
+    (let ((mcp-hub-servers '(("github"))))
+      (should (string-match-p "github"
+                              (madrigal-agent-controller--mcp-context "assistant")))
+      (should (string-match-p "github"
+                              (madrigal-agent-controller--mcp-context "do")))
+      (should-not (madrigal-agent-controller--mcp-context "do-dwim"))
+      (should-not (madrigal-agent-controller--mcp-context "developer")))
+    (let ((mcp-hub-servers '(("playwright"))))
+      (should (string-match-p "playwright"
+                              (madrigal-agent-controller--mcp-context "assistant"))))))
+
+(ert-deftest madrigal-agent-controller-mcp-context-failure-is-isolated ()
+  (cl-letf (((symbol-function 'madrigal-agent-controller--mcp-available-p)
+             (lambda () (error "broken MCP installation"))))
+    (should-not (madrigal-agent-controller--mcp-context "assistant"))))
+
 (ert-deftest madrigal-agent-provider-and-model-prompts-when-missing ()
   (let ((madrigal-providers '(("Provider A" :factory (lambda (model)
                                                         (concat "provider:" model))
@@ -2652,22 +2696,135 @@
                 source (madrigal-context-candidate-start candidate)
                 (madrigal-context-candidate-end candidate)))))))
 
-(ert-deftest madrigal-context-comint-provider-selects-interaction ()
+(ert-deftest madrigal-context-shell-provider-selects-comint-interaction ()
   (require 'comint)
   (with-temp-buffer
     (comint-mode)
-    (setq-local comint-prompt-regexp "^\\$ ")
+    (setq-local comint-prompt-regexp "^\\$ "
+                comint-use-prompt-regexp t)
     (let ((inhibit-read-only t))
       (insert "$ first\nfirst output\n$ second\nsecond output\n"))
     (goto-char (point-min))
     (search-forward "first output")
     (let* ((source (madrigal-context-capture))
-           (candidate (car (madrigal-context--comint-discover source)))
+           (candidates (madrigal-context--shell-discover source))
+           (candidate (seq-find
+                       (lambda (item)
+                         (equal "Terminal prompt interaction"
+                                (madrigal-context-candidate-label item)))
+                       candidates))
            (text (madrigal-context--source-text
                   source (madrigal-context-candidate-start candidate)
                   (madrigal-context-candidate-end candidate))))
-      (should (string-match-p "\\`\\$ first" text))
+      (should (string-prefix-p "first" text))
+      (should (string-suffix-p "$ " text))
       (should-not (string-match-p "second output" text)))))
+
+(ert-deftest madrigal-context-shell-provider-uses-terminal-prompt-navigation ()
+  (with-temp-buffer
+    (setq major-mode 'eat-mode)
+    (insert "λ first\nfirst output\nλ second\nsecond output\n")
+    (goto-char (point-min))
+    (search-forward "first output")
+    (cl-letf (((symbol-function 'eat-previous-shell-prompt)
+               (lambda (_)
+                 (re-search-backward "^λ " nil t)
+                 (goto-char (match-end 0))))
+              ((symbol-function 'eat-next-shell-prompt)
+               (lambda (_)
+                 (re-search-forward "^λ " nil t)
+                 (goto-char (match-end 0)))))
+      (let* ((source (madrigal-context-capture))
+             (candidates (madrigal-context--shell-discover source))
+             (prompt (car candidates))
+             (scroll (cadr candidates))
+             (text (madrigal-context--source-text
+                    source (madrigal-context-candidate-start prompt)
+                    (madrigal-context-candidate-end prompt))))
+        (should (string-prefix-p "first" text))
+        (should (string-suffix-p "λ " text))
+        (should-not (string-match-p "second output" text))
+        (should (> (madrigal-context-candidate-score prompt)
+                   (madrigal-context-candidate-score scroll)))))))
+
+(ert-deftest madrigal-context-shell-provider-spans-prompt-after-point ()
+  (with-temp-buffer
+    (insert (make-string 40 ?x))
+    (let ((previous-prompt-end 10)
+          (origin 20)
+          (next-prompt-end 30)
+          (functions '(madrigal-test-previous-prompt
+                       . madrigal-test-next-prompt)))
+      (cl-letf (((symbol-function 'madrigal-test-previous-prompt)
+                 (lambda (_) (goto-char previous-prompt-end)))
+                ((symbol-function 'madrigal-test-next-prompt)
+                 (lambda (_)
+                   (goto-char (if (>= (point) origin)
+                                  next-prompt-end
+                                origin)))))
+        (should (equal (cons previous-prompt-end next-prompt-end)
+                       (madrigal-context--shell-navigation-bounds
+                        origin functions)))))))
+
+(ert-deftest madrigal-context-shell-provider-clamps-missing-next-prompt ()
+  (with-temp-buffer
+    (insert (make-string 30 ?x))
+    (let ((previous-prompt-end 10)
+          (origin 20)
+          (functions '(madrigal-test-previous-prompt
+                       . madrigal-test-next-prompt)))
+      (cl-letf (((symbol-function 'madrigal-test-previous-prompt)
+                 (lambda (_) (goto-char previous-prompt-end)))
+                ((symbol-function 'madrigal-test-next-prompt)
+                 (lambda (_)
+                   (if (= (point) origin)
+                       (user-error "No later prompt")
+                     (goto-char origin)))))
+        (should (equal (cons previous-prompt-end (point-max))
+                       (madrigal-context--shell-navigation-bounds
+                        origin functions)))))))
+
+(ert-deftest madrigal-context-shell-provider-uses-uniform-shell-navigation ()
+  (require 'shell)
+  (with-temp-buffer
+    (shell-mode)
+    (insert "$ first\noutput\n$ second\n")
+    (let ((previous-prompt-end 4)
+          (origin 10)
+          (next-prompt-end 20))
+      (goto-char origin)
+      (cl-letf (((symbol-function 'comint-previous-prompt)
+                 (lambda (_) (goto-char previous-prompt-end)))
+                ((symbol-function 'comint-next-prompt)
+                 (lambda (_) (goto-char next-prompt-end))))
+        (let* ((source (madrigal-context-capture))
+               (prompt (car (madrigal-context--shell-discover source))))
+          (should (= previous-prompt-end
+                     (madrigal-context-candidate-start prompt)))
+          (should (= next-prompt-end
+                     (madrigal-context-candidate-end prompt))))))))
+
+(ert-deftest madrigal-context-shell-provider-adds-scroll-without-prompt-data ()
+  (with-temp-buffer
+    (setq major-mode 'eat-mode)
+    (insert (make-string 20000 ?x))
+    (goto-char 10000)
+    (cl-letf (((symbol-function 'eat-previous-shell-prompt)
+               (lambda (&optional _) (user-error "No previous prompt")))
+              ((symbol-function 'eat-next-shell-prompt)
+               (lambda (&optional _) (user-error "No next prompt"))))
+      (let* ((source (madrigal-context-capture))
+             (candidates (madrigal-context--shell-discover source))
+             (prompt (car candidates))
+             (scroll (cadr candidates)))
+        (should (= 2 (length candidates)))
+        (should (equal (cons (point-min) (point-max))
+                       (cons (madrigal-context-candidate-start prompt)
+                             (madrigal-context-candidate-end prompt))))
+        (should (equal "Terminal scrollback/forward"
+                       (madrigal-context-candidate-label scroll)))
+        (should (= 16384 (madrigal-context-candidate-size scroll)))
+        (should (madrigal-context-candidate-contains-point scroll))))))
 
 (ert-deftest madrigal-context-notmuch-show-selects-mail-and-thread ()
   (with-temp-buffer

@@ -17,6 +17,14 @@
 (declare-function diff-beginning-of-file "diff-mode" ())
 (declare-function diff-end-of-file "diff-mode" ())
 (declare-function message-goto-body "message" ())
+(declare-function comint-next-prompt "comint" (n))
+(declare-function comint-previous-prompt "comint" (n))
+(declare-function term-next-prompt "term" (n))
+(declare-function term-previous-prompt "term" (n))
+(declare-function eat-next-shell-prompt "eat" (&optional n))
+(declare-function eat-previous-shell-prompt "eat" (&optional n))
+(declare-function vterm-next-prompt "vterm" (n))
+(declare-function vterm-previous-prompt "vterm" (n))
 (declare-function notmuch-tree-get-prop "notmuch-tree" (prop &optional props))
 (declare-function ement-room-p "ement-structs" (object))
 (declare-function ement-event-p "ement-structs" (object))
@@ -438,7 +446,7 @@ PRIORITY multiplies each scope priority produced by DISCOVER."
     (and (buffer-live-p buffer)
          (with-current-buffer buffer
            (or (derived-mode-p 'diff-mode 'compilation-mode 'dired-mode
-                               'tabulated-list-mode 'message-mode 'comint-mode)
+                               'tabulated-list-mode 'message-mode)
                (derived-mode-p 'magit-section-mode))))))
 
 (defun madrigal-context--line-mode-discover (source)
@@ -602,52 +610,87 @@ PRIORITY multiplies each scope priority produced by DISCOVER."
                   candidates)))))
     (delq nil (nreverse candidates))))
 
-(defun madrigal-context--comint-applicable-p (source)
-  "Return non-nil when SOURCE is a Comint buffer."
+(defun madrigal-context--shell-applicable-p (source)
+  "Return non-nil when SOURCE is an interactive shell-style buffer."
   (let ((buffer (madrigal-context-source-buffer source)))
     (and (buffer-live-p buffer)
-         (with-current-buffer buffer (derived-mode-p 'comint-mode)))))
+         (with-current-buffer buffer
+           (derived-mode-p 'comint-mode 'term-mode 'eat-mode 'vterm-mode
+                           'eshell-mode)))))
 
-(defun madrigal-context--comint-discover (source)
-  "Discover the prompt, command, and output interaction around point."
-  (let ((buffer (madrigal-context-source-buffer source)))
+(defun madrigal-context--shell-prompt-functions ()
+  "Return the prompt navigation functions supported by the current mode."
+  (cond
+   ((and (derived-mode-p 'eat-mode)
+         (fboundp 'eat-previous-shell-prompt)
+         (fboundp 'eat-next-shell-prompt))
+    '(eat-previous-shell-prompt . eat-next-shell-prompt))
+   ((and (derived-mode-p 'vterm-mode)
+         (fboundp 'vterm-previous-prompt) (fboundp 'vterm-next-prompt))
+    '(vterm-previous-prompt . vterm-next-prompt))
+   ((and (derived-mode-p 'term-mode)
+         (fboundp 'term-previous-prompt) (fboundp 'term-next-prompt))
+    '(term-previous-prompt . term-next-prompt))
+   ((and (derived-mode-p 'comint-mode)
+         (fboundp 'comint-previous-prompt) (fboundp 'comint-next-prompt))
+    '(comint-previous-prompt . comint-next-prompt))))
+
+(defun madrigal-context--shell-move-to-prompt
+    (function position count boundary direction)
+  "Move from POSITION by COUNT prompts, clamping failures to BOUNDARY.
+
+DIRECTION is negative for previous prompts and positive for following prompts."
+  (goto-char position)
+  (let ((destination
+         (condition-case nil
+             (progn (funcall function count) (point))
+           (error boundary))))
+    (if (if (< direction 0)
+            (< destination position)
+          (> destination position))
+        destination
+      boundary)))
+
+(defun madrigal-context--shell-navigation-bounds (origin functions)
+  "Return bounds from two prompts back through one prompt ahead of ORIGIN."
+  (let ((start
+         (madrigal-context--shell-move-to-prompt
+          (car functions) origin 2 (point-min) -1))
+        (end
+         (madrigal-context--shell-move-to-prompt
+          (cdr functions) origin 1 (point-max) 1)))
+    (and (< start end) (cons start end))))
+
+(defun madrigal-context--terminal-scroll-bounds (source)
+  "Return up to 16 KiB centred on point in SOURCE."
+  (pcase-let ((`(,minimum . ,maximum)
+               (madrigal-context-source-restriction source)))
+    (let ((position (madrigal-context-source-point source)))
+      (cons (max minimum (- position 8192))
+            (min maximum (+ position 8192))))))
+
+(defun madrigal-context--shell-discover (source)
+  "Discover prompt and terminal scroll contexts around point in SOURCE."
+  (let ((buffer (madrigal-context-source-buffer source)) candidates)
     (with-current-buffer buffer
       (save-excursion
-        (goto-char (madrigal-context-source-point source))
-        (let* ((origin (point))
-               (prompt-regexp
-                (and (boundp 'comint-prompt-regexp)
-                     (stringp comint-prompt-regexp)
-                     (not (string-empty-p comint-prompt-regexp))
-                     comint-prompt-regexp))
-               (start
-                (or (and prompt-regexp
-                         (save-excursion
-                           (beginning-of-line)
-                           (if (looking-at-p prompt-regexp)
-                               (point)
-                             (and (re-search-backward prompt-regexp nil t)
-                                  (line-beginning-position)))))
-                    (condition-case nil
-                        (progn (goto-char origin)
-                               (comint-previous-prompt 1) (point))
-                      (error (line-beginning-position)))))
-               (end
-                (or (and prompt-regexp
-                         (save-excursion
-                           (goto-char origin)
-                           (forward-line 1)
-                           (and (re-search-forward prompt-regexp nil t)
-                                (match-beginning 0))))
-                    (condition-case nil
-                        (progn (goto-char origin)
-                               (comint-next-prompt 1)
-                               (line-beginning-position))
-                      (error (point-max))))))
-          (delq nil
-                (list (madrigal-context--bounds-candidate
-                       source 'comint 'interaction "Comint interaction"
-                       (cons start (max start end)) 0.96 t))))))))
+        (let* ((origin (madrigal-context-source-point source))
+               (functions (madrigal-context--shell-prompt-functions))
+               (prompt-bounds
+                (and functions
+                     (madrigal-context--shell-navigation-bounds
+                      origin functions))))
+          (when prompt-bounds
+            (push (madrigal-context--bounds-candidate
+                   source 'shell 'prompt "Terminal prompt interaction"
+                   prompt-bounds 0.98 t)
+                  candidates))
+          (push (madrigal-context--bounds-candidate
+                 source 'shell 'terminal-scroll
+                 "Terminal scrollback/forward"
+                 (madrigal-context--terminal-scroll-bounds source) 0.65)
+                candidates))))
+    (delq nil (nreverse candidates))))
 
 (defun madrigal-context--notmuch-applicable-p (source)
   "Return non-nil when SOURCE is a Notmuch result or message buffer."
@@ -1291,8 +1334,8 @@ When SCOPE is non-nil, select that target without prompting."
                                     #'madrigal-context--tabulated-list-discover)
 (madrigal-context-register-provider 'message 1.0 #'madrigal-context--message-applicable-p
                                     #'madrigal-context--message-discover)
-(madrigal-context-register-provider 'comint 1.0 #'madrigal-context--comint-applicable-p
-                                    #'madrigal-context--comint-discover)
+(madrigal-context-register-provider 'shell 1.0 #'madrigal-context--shell-applicable-p
+                                    #'madrigal-context--shell-discover)
 (madrigal-context-register-provider 'notmuch 1.0 #'madrigal-context--notmuch-applicable-p
                                     #'madrigal-context--notmuch-discover)
 (madrigal-context-register-provider 'ement-room-list 1.0

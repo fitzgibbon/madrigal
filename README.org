@@ -99,6 +99,12 @@ it:
 - =persist-elisp= adds or updates reusable Emacs Lisp definitions for future
   requests and normal interactive use.
 
+When mcp.el and configured mcp-hub servers are present, =madrigal-do= and the
+persistent =assistant= receive a compact list of server names. They can inspect
+and call those services through =eval=. If =playwright= is configured, Madrigal
+is instructed to use that browser connection rather than Emacs or shell web
+access. MCP remains an optional dependency and adds no Madrigal tool of its own.
+
 *** Context selection
 
 Context actions discover local syntax, text, buffer, project, and Emacs-session
