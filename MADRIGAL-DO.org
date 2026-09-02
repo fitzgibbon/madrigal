@@ -20,7 +20,7 @@
 - Eval calls re-enter the captured buffer and live window at tracked point/mark markers, even after the user moves focus or edits preceding text.
 - Added UI-independent eval event sinks while preserving Org rendering.
 - Added =madrigal-do= with 1000-item default retention for Lisp action, turn, tool, and tool-result records.
-- Added tool-free =madrigal-do-dwim= suggestions using a provider-independent JSON schema, strict validation, and minibuffer selection through the shared executor.
+- Added tool-free =madrigal-do-dwim= suggestions using a compact sum-of-products JSON schema. Selected immediate actions execute one validated eval invocation directly; prompts and custom input use the shared executor.
 - Added bounded reflection entry points, action self-introspection helpers, and a reduced eager eval-tool description.
 - Added history/token caching and idle-delayed Org context refreshes.
 - Added initial ERT coverage and user documentation.
@@ -57,7 +57,7 @@ Use bounded =madrigal-action= and =madrigal-tool-event= structures for active an
 
 ** Prompt design
 
-Use a minimal stable system prompt for execution. Mark captured editor content as data rather than instructions. The sole execution tool is Emacs Lisp eval. Suggestion generation receives the same focus context but no tools and cannot alter Emacs.
+Use a minimal stable system prompt for execution. Mark captured editor content as data rather than instructions. The sole execution tool is Emacs Lisp eval. Final responses select either a brief echo-area string or a complete Org document shown read-only with =q= bound to quit. Suggestion generation receives the same focus context but no tools and cannot alter Emacs.
 
 ** Reflection
 
@@ -95,7 +95,7 @@ Keep Org as the editable persistence format. Add concise working-directory/proje
 
 - Add the minimal =do= agent.
 - Add action and tool-event records with bounded retention.
-- Implement the shared executor and minibuffer-only final-summary presentation.
+- Implement the shared executor and structured echo-area or Org-document presentation.
 - Add cancellation and inspection.
 - Test request construction, continuation, result storage, and lack of cross-action history.
 
@@ -128,3 +128,108 @@ Keep Org as the editable persistence format. Add concise working-directory/proje
 - Document commands, configuration, result UI, scope rules, and privacy/context limits.
 - Update architecture diagrams.
 - Run byte compilation, ERT, and package checks.
+
+* DONE Phase 9: immediate actions and prompt DWIM
+
+** Decision
+
+DWIM presents two kinds of suggestions:
+
+- *Immediate actions* are concrete Emacs tool operations.  Selecting one performs
+  its prepared tool action immediately against the captured focus context.  It does
+  not create a =madrigal-do= action, request another model turn, or invoke the
+  larger execution model.
+- *Prompts* are questions, investigations, explanations, plans, or other advisory
+  requests.  Selecting one starts a normal =madrigal-do= request with the captured
+  focus context.
+
+The suggestion response contains everything needed to run an immediate action or
+to make a prompt.  Generation remains tool-free: no Emacs evaluation
+occurs while candidates are being produced or while the menu is displayed.  User
+selection is the authorization boundary for an immediate action.  Custom minibuffer
+input is a normal =madrigal-do= request.
+
+** User experience
+
+- Present a small ranked menu in the original concise format.  Place ⚡ after the
+  relevance circle for immediate actions and 🧠 for prompts.
+- An action description states the operation and target.  Selecting it runs the
+  operation directly, showing only its value on success or ❌ and the error on failure.
+- A prompt states the question or investigation and launches the normal executor.
+- Users may edit a prompt, enter custom text, or quit.  Edited and
+  custom text is treated as an ordinary =madrigal-do= request.  An action candidate
+  is selected as-is; editing it must not accidentally run stale prepared tool data.
+- If the origin is stale or killed before selection, do not run an immediate action
+  or launch a request; use the existing stale-origin handling.
+
+** Data model and protocol
+
+- Model each candidate as =relevance × ((description × tool call) + prompt)=.
+- An action candidate carries a concise description and one validated, bounded
+  direct tool call with arguments needed for the frozen focus context.  It carries
+  no controller continuation, provider handle, or pending model turn.
+- A prompt candidate carries the text supplied to =madrigal-do=.
+- Validate alternative-specific fields, field bounds, duplicate text, and the direct
+  invocation representation.  Discard malformed candidates independently and retain
+  valid candidates.  Do not reinterpret tool calls or prose outside the schema.
+- Keep suggestion diagnostics and immediate-action results bounded and separate from
+  ordinary =madrigal-do= action history.
+
+** Execution model
+
+- Capture and freeze focus before requesting suggestions.
+- Request suggestions without tools.  The response may describe a direct action but
+  cannot execute it.
+- For a selected action, revalidate that the origin and invocation are still valid,
+  then invoke the Emacs eval tool directly with the frozen context.  Render and
+  retain the resulting tool event without creating a controller action.
+- For a selected prompt, call the existing =madrigal-do= executor with only its
+  text and frozen focus context.
+- Never route an immediate action through =madrigal-do=, a controller checkpoint,
+  a provider continuation, or the larger execution model.
+
+** Implementation plan
+
+*** 1. Define the sum-of-products schema and validation
+
+- Add records, normalization, and bounded diagnostics.
+- Define the restricted direct-invocation representation and validate it before the
+  menu is shown and again before execution.
+- Keep prompts and action tool calls distinct so editing display text cannot execute
+  prepared tool data.
+
+*** 2. Generate and present suggestions
+
+- Update the tool-free request to produce ranked immediate actions or prompts and
+  no live tool calls.
+- Add grouped completion display and annotations while retaining plain-text support.
+- Preserve cancellation, occupied-minibuffer, stale-origin, and partial-invalid
+  response handling.
+
+*** 3. Execute selected immediate actions directly
+
+- Add a direct tool-invocation path that restores the frozen focus context, invokes
+  eval, and presents its value or error directly.
+- Ensure it has no =madrigal-do= action record, controller state, execution-model
+  request, or later model turn.
+- Keep result retention, cancellation, and error reporting appropriate for a single
+  immediate tool operation.
+
+*** 4. Route prompts through the ordinary executor
+
+- Pass a selected prompt and frozen context to =madrigal-do=.
+- Treat edited prompts and custom input identically to ordinary typed requests.
+- Do not pass action metadata or direct tool-call data to the
+  execution model.
+
+*** 5. Test and document
+
+- Test parsing and validation for both categories, malformed invocations, duplicate
+  candidates, and partial-valid responses.
+- Test that generation and menu display make no eval call; selecting an action makes
+  exactly one direct tool invocation and no =madrigal-do= request; selecting a prompt
+  makes one ordinary request.
+- Test edited/custom input, cancellation, stale origins, result presentation, and
+  absence of execution-model traffic for immediate actions.
+- Document the two categories, explicit-selection behavior, direct-action limits,
+  and context/privacy rules.

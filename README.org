@@ -19,19 +19,13 @@ Madrigal also provides optional, persistent Org conversations through the
 
 ** Installation
 
-Madrigal requires Emacs 29.1 or later and depends on [[https://github.com/ahyatt/llm][llm.el]]. Obtain its
-source and add the directory to =load-path=. For example, with Pijul:
-
-#+begin_src shell
-pijul clone https://nest.pijul.com/fitzgibbon/madrigal
-#+end_src
-
+Madrigal requires Emacs 29.1 or later and depends on [[https://github.com/ahyatt/llm][llm.el]].
 Configure an =llm.el= provider, then give Madrigal the provider object and its
 available model names. This example uses the OpenAI Responses provider:
 
 #+begin_src emacs-lisp
 (use-package llm-openai-responses
-  :ensure nil
+  :vc (:url "https://github.com/fitzgibbon/llm-openai-responses.git")
   :after llm
   :config
   (setq my-madrigal-openai-provider
@@ -42,8 +36,7 @@ available model names. This example uses the OpenAI Responses provider:
          :embedding-model "text-embedding-3-small")))
 
 (use-package madrigal
-  :ensure nil
-  :load-path "/path/to/madrigal"
+  :vc (:url "https://github.com/fitzgibbon/madrigal.git")
   :after (llm llm-openai-responses)
   :bind
   (("C-:" . madrigal-do)
@@ -76,15 +69,28 @@ chain.
 
 Use =M-x madrigal-do= when you know what you want Emacs to accomplish at point.
 Enter a focused instruction such as renaming the current definition, fixing a
-diagnostic, reorganising a subtree, or changing an Emacs setting. Madrigal does
-the work and reports the result with a brief summary.
+diagnostic, reorganising a subtree, or changing an Emacs setting. Madrigal
+returns either a brief unformatted result in the echo area or a standalone Org
+document in a read-only Org-mode window named by the model and prefixed with
+=Madrigal response:=. Press =q= to close a document response.
 
 *** =madrigal-do-dwim=
 
-Use =M-x madrigal-do-dwim= when the useful next action is apparent from the
-current context but you do not want to formulate it yourself. Choose one of
-Madrigal's suggestions or enter your own instruction; Madrigal then carries out
-the selected action.
+Use =M-x madrigal-do-dwim= when the useful next step is apparent from the
+current context but you do not want to formulate it yourself. In the completion
+menu, ⚡ marks an immediate action and 🧠 marks a =madrigal-do= prompt:
+
+- An immediate action is one prepared, bounded =eval= operation. Selecting its
+  unchanged label authorizes that operation and runs it directly, without an
+  execution-model request or controller continuation. A successful operation
+  displays only its return value; a failure displays ❌ followed by the error.
+- A prompt is sent through the ordinary =madrigal-do= executor. Questions,
+  investigations, explanations, and plans use this path.
+
+Editing a candidate or entering custom text always creates an ordinary focused
+action. Quitting performs nothing. Suggestion generation and menu display are
+tool-free; no operation runs until selection. A killed or otherwise stale origin
+prevents either alternative from running.
 
 *** =madrigal-do-project=
 
@@ -123,6 +129,9 @@ mode can provide a custom selector by setting the buffer-local
 *** Concurrent requests and cancellation
 
 Requests run asynchronously, and you can have more than one active at a time.
+The mode line shows 🧠 followed by one coloured spinner per active
+=madrigal-do= request. Each spinner uses the colour of that request's origin
+highlight. On completion it becomes a matching ✓ or ✗ for two seconds.
 =M-x madrigal-do-cancel= cancels the newest active action or suggestion request.
 
 *** History and inspection
@@ -132,7 +141,11 @@ Use =M-x madrigal-do-history= to browse running and completed actions. Use
 context, response, status, and timing.
 
 Completed action and suggestion records share the
-=madrigal-do-history-length= limit, which defaults to 1000.
+=madrigal-do-history-length= limit, which defaults to 1000. Immediate operation
+results are kept separately. Use =M-x madrigal-do-immediate-history= to browse
+and inspect them in read-only Org buffers. The
+=madrigal-do-immediate-history-length= option bounds that history and defaults
+to 100.
 
 ** Persistent Emacs Lisp
 
@@ -165,28 +178,42 @@ Session controls include:
 
 *** Babel assistant
 
-The =babel-assistant= agent uses an Org =* Request= turn. It inserts and
-executes complete Org Babel blocks, retains each block and result in the
-transcript, and finishes with an Org response.
+In an Org-mode conversation, the =babel-assistant= agent services requests
+through Org Babel, rather than only evaluating Emacs Lisp. It inserts and
+executes complete blocks in enabled languages, retains each block and result
+in the transcript, and finishes with an Org response.
+
+Install and enable the Babel language provided by [[https://github.com/fitzgibbon/ob-mcp][ob-mcp]].
+It uses the MCP servers configured with the [[https://github.com/lizqwerscott/mcp.el][mcp]] package,
+including =mcp-hub-servers=. The Babel assistant can then use those servers
+from Org Babel blocks. Include =mcp= in =madrigal-babel-allowed-languages=
+when restricting the available languages.
 
 Enable Babel languages normally, then optionally restrict which languages the
 agent may use:
 
 #+begin_src emacs-lisp
+(use-package ob-mcp
+  :vc (:url "https://github.com/fitzgibbon/ob-mcp.git"))
+
 (use-package ob
   :ensure nil
+  :after ob-mcp
   :config
   (org-babel-do-load-languages
    'org-babel-load-languages
    '((emacs-lisp . t)
+     (mcp . t)
      (python . t)))
-  (setq madrigal-babel-allowed-languages '(emacs-lisp python)))
+  (setq madrigal-babel-allowed-languages '(emacs-lisp mcp python)))
 #+end_src
 
 ** Authority and trust
 
 Madrigal is an operator, not a sandbox. The =eval= and =persist-elisp= tools can
-execute Emacs Lisp with the authority of your Emacs process. Babel blocks have
+execute Emacs Lisp with the authority of your Emacs process. A DWIM immediate
+action has the same authority, but is restricted to one bounded =eval=
+invocation and requires selection of its unchanged label. Babel blocks have
 the same authority as blocks you execute interactively. Review provider privacy
 and retention policies before sending buffer or project context, and only use
 models and prompts you trust with this access.

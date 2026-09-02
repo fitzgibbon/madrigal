@@ -316,10 +316,11 @@ CONTEXT-LIMIT bounds the mode-selected buffer text around point."
              (buffer-context (plist-get origin :buffer-context)))
         (unless (buffer-live-p buffer)
           (user-error "Madrigal :origin :buffer must be live"))
-        (when (and window
-                   (not (and (window-live-p window)
-                             (eq (window-buffer window) buffer))))
-          (user-error "Madrigal :origin :window must display its buffer"))
+        ;; A request can outlive the viewport from which it was made.
+        ;; Retain a window only while it still presents the origin buffer.
+        (unless (and (window-live-p window)
+                     (eq (window-buffer window) buffer))
+          (cl-remf origin :window))
         (when buffer-context
           (setq buffer-context (copy-sequence buffer-context))
           (unless (madrigal-focus--plist-p buffer-context)

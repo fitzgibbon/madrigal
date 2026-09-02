@@ -24,6 +24,11 @@
   :type 'natnum
   :group 'madrigal)
 
+(defcustom madrigal-do-immediate-history-length 100
+  "Number of completed immediate DWIM operations retained in Lisp records."
+  :type 'natnum
+  :group 'madrigal)
+
 (defcustom madrigal-do-summary-max-length 240
   "Maximum characters displayed for a completed action summary.
 
@@ -83,16 +88,37 @@ that accent over the default background at separate context and point strengths.
   status
   turns
   tool-events
+  response-kind
+  response-name
   response
   error
   started-at
   finished-at
-  indicator)
+  indicator
+  ui-face)
 
 (cl-defstruct (madrigal-action-suggestion
                (:constructor madrigal-action-suggestion-create))
   relevance
-  action)
+  action
+  prompt)
+
+(cl-defstruct (madrigal-suggestion-diagnostic
+               (:constructor madrigal-suggestion-diagnostic-create))
+  index
+  message)
+
+(cl-defstruct (madrigal-immediate-action
+               (:constructor madrigal-immediate-action-create))
+  id
+  suggestion
+  context
+  status
+  tool-events
+  result
+  error
+  started-at
+  finished-at)
 
 (cl-defstruct (madrigal-dwim-suggestion-request
                (:constructor madrigal-dwim-suggestion-request-create))
@@ -108,7 +134,8 @@ that accent over the default background at separate context and point strengths.
   started-at
   finished-at
   handle
-  indicator)
+  indicator
+  diagnostics)
 
 (defvar madrigal-do--active-actions nil
   "Active `madrigal-action' records.")
@@ -124,6 +151,38 @@ that accent over the default background at separate context and point strengths.
 
 (defvar madrigal-do--recent-dwim-suggestions nil
   "Completed DWIM suggestion records, newest first.")
+
+(defvar madrigal-do--recent-immediate-actions nil
+  "Completed immediate DWIM operation records, newest first.")
+
+(defvar madrigal-do--last-suggestion-diagnostics nil
+  "Diagnostics produced by the most recent suggestion parse.")
+
+(defvar madrigal-do--mode-line-feedback nil
+  "Recently completed actions awaiting removal from the mode line.")
+
+(defvar madrigal-do--spinner-timer nil
+  "Timer advancing active Madrigal request spinners.")
+
+(defvar madrigal-do--spinner-index 0
+  "Current frame index for Madrigal request spinners.")
+
+(defconst madrigal-do--spinner-frames ["⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏"])
+
+(defvar madrigal-do--mode-line-construct
+  '(:eval (madrigal-do--mode-line-string)))
+
+(put 'madrigal-do--mode-line-construct 'risky-local-variable t)
+
+(unless (memq 'madrigal-do--mode-line-construct global-mode-string)
+  (setq global-mode-string
+        (append global-mode-string '(madrigal-do--mode-line-construct))))
+
+(defconst madrigal-do--suggestion-max-count 8)
+(defconst madrigal-do--suggestion-description-limit 80)
+(defconst madrigal-do--suggestion-prompt-limit 500)
+(defconst madrigal-do--direct-source-limit 4000)
+(defconst madrigal-do--diagnostic-limit 8)
 
 (defun madrigal-do--next-request-accent ()
   "Return the next theme face and rainbow hue for a request."
@@ -188,8 +247,76 @@ that accent over the default background at separate context and point strengths.
       (cons (list :inherit 'highlight :extend t)
             (list :inherit theme-face :weight 'bold :box t)))))
 
+(defun madrigal-do--mode-line-face (accent)
+  "Return a mode-line face matching request ACCENT."
+  (let* ((faces (madrigal-do--request-highlight-faces
+                 (car accent) (cdr accent)))
+         (context-face (car faces))
+         (colour (plist-get context-face :background)))
+    (if colour
+        (list :foreground colour :weight 'bold)
+      (cdr faces))))
+
+(defun madrigal-do--indicator-mode-line-face (indicator)
+  "Return a mode-line face matching request INDICATOR."
+  (let* ((face (and (overlayp (car-safe indicator))
+                    (overlay-get (car indicator) 'face)))
+         (colour (and (listp face) (plist-get face :background))))
+    (if colour (list :foreground colour :weight 'bold) face)))
+
+(defun madrigal-do--mode-line-string ()
+  "Return coloured status indicators for focused Madrigal requests."
+  (let* ((frame (aref madrigal-do--spinner-frames
+                      (mod madrigal-do--spinner-index
+                           (length madrigal-do--spinner-frames))))
+         (active
+          (mapcar
+           (lambda (action)
+             (propertize frame
+                         'face (madrigal-action-ui-face action)
+                         'help-echo (madrigal-action-instruction action)))
+           (reverse madrigal-do--active-actions)))
+         (completed
+          (mapcar
+           (lambda (entry)
+             (let ((action (car entry)))
+               (propertize (cdr entry)
+                           'face (madrigal-action-ui-face action)
+                           'help-echo (madrigal-action-instruction action))))
+           (reverse madrigal-do--mode-line-feedback)))
+         (indicators (append active completed)))
+    (when indicators
+      (concat " 🧠 " (string-join indicators " ")))))
+
+(defun madrigal-do--spinner-tick ()
+  "Advance the focused-action mode-line spinner."
+  (setq madrigal-do--spinner-index (1+ madrigal-do--spinner-index))
+  (force-mode-line-update t)
+  (unless madrigal-do--active-actions
+    (when (timerp madrigal-do--spinner-timer)
+      (cancel-timer madrigal-do--spinner-timer))
+    (setq madrigal-do--spinner-timer nil)))
+
+(defun madrigal-do--ensure-spinner-timer ()
+  "Start the focused-action spinner timer when needed."
+  (unless (timerp madrigal-do--spinner-timer)
+    (setq madrigal-do--spinner-timer
+          (run-at-time 0 0.12 #'madrigal-do--spinner-tick))))
+
+(defun madrigal-do--add-mode-line-feedback (action glyph)
+  "Show GLYPH for completed ACTION for two seconds."
+  (let ((entry (cons action glyph)))
+    (push entry madrigal-do--mode-line-feedback)
+    (force-mode-line-update t)
+    (run-at-time
+     2 nil
+     (lambda ()
+       (setq madrigal-do--mode-line-feedback
+             (delq entry madrigal-do--mode-line-feedback))
+       (force-mode-line-update t)))))
+
 (defun madrigal-do--make-request-indicator (context &optional face)
-  "Highlight CONTEXT using colours derived from the theme FACE."
+  "Highlight CONTEXT using colours derived from FACE or an accent pair."
   (let* ((context (madrigal-focus-normalize-context context))
          (buffer (madrigal-focus-context-origin-buffer context))
          (buffer-context (plist-get (plist-get context :origin) :buffer-context))
@@ -206,7 +333,8 @@ that accent over the default background at separate context and point strengths.
                  (end (if range
                           (min (point-max) (cdr range))
                         (min (point-max) (1+ (line-end-position)))))
-                 (accent (or (and face (cons face 0.0))
+                 (accent (or (and (consp face) face)
+                             (and face (cons face 0.0))
                              (madrigal-do--next-request-accent)))
                  (faces (madrigal-do--request-highlight-faces
                          (car accent) (cdr accent)))
@@ -245,20 +373,58 @@ that accent over the default background at separate context and point strengths.
       (when (and (markerp marker) (marker-buffer marker))
         (goto-char marker)))))
 
-(defconst madrigal-do--suggestion-response-schema
+(defconst madrigal-do--action-response-schema
   '(:type "object"
     :properties
+    (:result
+     (:anyOf
+      [(:type "object" :properties
+        (:echo (:type "string" :minLength 1 :maxLength 240))
+        :required ["echo"] :additionalProperties :false)
+       (:type "object" :properties
+        (:document
+         (:type "object" :properties
+          (:name (:type "string" :minLength 1 :maxLength 80)
+           :content (:type "string" :minLength 1))
+          :required ["name" "content"] :additionalProperties :false))
+        :required ["document"] :additionalProperties :false)]))
+    :required ["result"] :additionalProperties :false)
+  "Structured final response for a focused Madrigal action.")
+
+(defconst madrigal-do--suggestion-response-schema
+  `(:type "object"
+    :properties
     (:suggestions
-     (:type "array"
+     (:type "array" :maxItems ,madrigal-do--suggestion-max-count
       :items
-      (:type "object"
-       :properties
-       (:relevance (:type "number" :minimum 0 :maximum 1)
-        :action (:type "string" :maxLength 80))
-       :required ["relevance" "action"]
-       :additionalProperties :false)))
-    :required ["suggestions"])
-  "JSON schema for DWIM action suggestions.")
+      (:anyOf
+       [(:type "object"
+         :properties
+         (:relevance (:type "number" :minimum 0 :maximum 1)
+          :action
+          (:type "object"
+           :properties
+           (:description
+            (:type "string" :maxLength ,madrigal-do--suggestion-description-limit)
+            :tool_call
+            (:type "object"
+             :properties
+             (:name (:type "string" :enum ["eval"])
+              :arguments
+              (:type "object"
+               :properties
+               (:source (:type "string" :maxLength ,madrigal-do--direct-source-limit))
+               :required ["source"] :additionalProperties :false))
+             :required ["name" "arguments"] :additionalProperties :false))
+           :required ["description" "tool_call"] :additionalProperties :false))
+         :required ["relevance" "action"] :additionalProperties :false)
+        (:type "object"
+         :properties
+         (:relevance (:type "number" :minimum 0 :maximum 1)
+          :prompt (:type "string" :maxLength ,madrigal-do--suggestion-prompt-limit))
+         :required ["relevance" "prompt"] :additionalProperties :false)])))
+    :required ["suggestions"] :additionalProperties :false)
+  "JSON schema for ranked immediate actions and Madrigal prompts.")
 
 (defun madrigal-do--remember-dwim-suggestion (request)
   "Retain completed DWIM suggestion REQUEST within the configured bound."
@@ -293,6 +459,10 @@ When KEEP-INDICATOR is non-nil, transfer its indicator to a selected action."
   "Retain completed ACTION within the configured bound."
   (madrigal-do--delete-request-indicator (madrigal-action-indicator action))
   (setq madrigal-do--active-actions (delq action madrigal-do--active-actions))
+  (pcase (madrigal-action-status action)
+    ('finished (madrigal-do--add-mode-line-feedback action "✓"))
+    ('error (madrigal-do--add-mode-line-feedback action "✗")))
+  (force-mode-line-update t)
   (if (zerop madrigal-do-history-length)
       (setq madrigal-do--recent-actions nil)
     (push action madrigal-do--recent-actions)
@@ -301,31 +471,46 @@ When KEEP-INDICATOR is non-nil, transfer its indicator to a selected action."
                       madrigal-do--recent-actions)
               nil))))
 
-(defun madrigal-do--record-tool-event (action event)
-  "Record lifecycle EVENT in ACTION's tool history."
+(defun madrigal-do--updated-tool-events (events event)
+  "Return EVENTS updated with lifecycle EVENT."
   (pcase (plist-get event :phase)
     ('started
-     (setf (madrigal-action-tool-events action)
-           (append
-            (madrigal-action-tool-events action)
-            (list
-             (madrigal-tool-event-create
-              :id (plist-get event :id)
-              :name (plist-get event :name)
-              :language (plist-get event :language)
-              :source (plist-get event :source)
-              :started-at (current-time))))))
+     (append events
+             (list (madrigal-tool-event-create
+                    :id (plist-get event :id)
+                    :name (plist-get event :name)
+                    :language (plist-get event :language)
+                    :source (plist-get event :source)
+                    :started-at (current-time)))))
     ('finished
-     (let ((tool-event
-            (seq-find
-             (lambda (item)
-               (equal (madrigal-tool-event-id item) (plist-get event :id)))
-             (madrigal-action-tool-events action))))
-       (when tool-event
-         (setf (madrigal-tool-event-source tool-event) (plist-get event :source)
-               (madrigal-tool-event-result tool-event)
-               (or (plist-get event :formatted-result) (plist-get event :result))
-               (madrigal-tool-event-finished-at tool-event) (current-time)))))))
+     (when-let* ((tool-event
+                  (seq-find
+                   (lambda (item)
+                     (equal (madrigal-tool-event-id item) (plist-get event :id)))
+                   events)))
+       (setf (madrigal-tool-event-source tool-event) (plist-get event :source)
+             (madrigal-tool-event-result tool-event)
+             (or (plist-get event :formatted-result) (plist-get event :result))
+             (madrigal-tool-event-finished-at tool-event) (current-time)))
+     events)
+    (_ events)))
+
+(defun madrigal-do--record-tool-event (action event)
+  "Record lifecycle EVENT in ACTION's tool history."
+  (setf (madrigal-action-tool-events action)
+        (madrigal-do--updated-tool-events
+         (madrigal-action-tool-events action) event)))
+
+(defun madrigal-do--remember-immediate-action (operation)
+  "Retain completed immediate OPERATION within its independent bound."
+  (if (zerop madrigal-do-immediate-history-length)
+      (setq madrigal-do--recent-immediate-actions nil)
+    (push operation madrigal-do--recent-immediate-actions)
+    (when (> (length madrigal-do--recent-immediate-actions)
+             madrigal-do-immediate-history-length)
+      (setcdr (nthcdr (1- madrigal-do-immediate-history-length)
+                      madrigal-do--recent-immediate-actions)
+              nil))))
 
 (defun madrigal-do--brief-summary (text)
   "Normalize TEXT as a brief single-line action summary."
@@ -337,10 +522,59 @@ When KEEP-INDICATOR is non-nil, transfer its indicator to a selected action."
      ((or (zerop limit) (<= (length summary) limit)) summary)
      (t (concat (substring summary 0 (max 0 (- limit 1))) "…")))))
 
+(defun madrigal-do--parse-action-response (text)
+  "Parse structured focused-action response TEXT."
+  (let* ((object (json-parse-string
+                  (madrigal-do--json-response-text text)
+                  :object-type 'plist :array-type 'list
+                  :null-object nil :false-object nil))
+         (_ (madrigal-do--require-json-keys
+             object '(:result) "action response"))
+         (object (plist-get object :result)))
+    (cond
+     ((plist-member object :echo)
+      (madrigal-do--require-json-keys object '(:echo) "action result")
+      (list :kind 'echo
+            :content
+            (madrigal-do--brief-summary
+             (madrigal-do--suggestion-string object :echo 240))))
+     ((plist-member object :document)
+      (madrigal-do--require-json-keys object '(:document) "action result")
+      (let ((document (plist-get object :document)))
+        (madrigal-do--require-json-keys
+         document '(:name :content) "action document")
+        (let ((name (madrigal-do--suggestion-string document :name 80))
+              (content (plist-get document :content)))
+          (when (string-match-p "[\n\r]" name)
+            (error "Invalid Madrigal action document name"))
+          (unless (and (stringp content)
+                       (not (string-empty-p (string-trim content))))
+            (error "Invalid Madrigal action document content"))
+          (list :kind 'document :name name :content content))))
+     (t (error "Invalid Madrigal action response")))))
+
+(defun madrigal-do--show-document (action)
+  "Pop up ACTION's Org response in a read-only buffer."
+  (let ((buffer (generate-new-buffer
+                 (format "*Madrigal response: %s*"
+                         (madrigal-action-response-name action)))))
+    (with-current-buffer buffer
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (org-mode)
+        (insert (madrigal-action-response action))
+        (goto-char (point-min))
+        (font-lock-ensure)
+        (local-set-key (kbd "q") #'quit-window)
+        (setq buffer-read-only t)))
+    (pop-to-buffer buffer)))
+
 (defun madrigal-do--show-result (action)
-  "Display ACTION's final summary in the minibuffer."
-  (message "Madrigal: %s"
-           (or (madrigal-action-response action) "Action completed.")))
+  "Present ACTION's echo or Org document response."
+  (pcase (madrigal-action-response-kind action)
+    ('document (madrigal-do--show-document action))
+    (_ (message "Madrigal: %s"
+                (or (madrigal-action-response action) "Action completed.")))))
 
 (defun madrigal-do--resolve-action (&optional action)
   "Return ACTION, the current eval action, or signal an error."
@@ -484,6 +718,9 @@ INDICATOR, when non-nil, is transferred from a DWIM suggestion request."
                        buffer)))
          (owns-buffer (null origin-buffer)))
     (let* ((id (madrigal--next-request-id))
+           (accent (and (null indicator) (madrigal-do--next-request-accent)))
+           (request-indicator
+            (or indicator (madrigal-do--make-request-indicator context accent)))
            (action (madrigal-action-create
                     :id id
                     :kind (or kind 'prompt)
@@ -498,18 +735,23 @@ INDICATOR, when non-nil, is transferred from a DWIM suggestion request."
                              :final t :at (current-time)))
                     :tool-events nil
                     :started-at (current-time)
-                    :indicator (or indicator
-                                   (madrigal-do--make-request-indicator context))))
+                    :indicator request-indicator
+                    :ui-face (if indicator
+                                 (madrigal-do--indicator-mode-line-face indicator)
+                               (madrigal-do--mode-line-face accent))))
            (event-sink
             (lambda (event)
               (madrigal-do--record-tool-event action event))))
       (push action madrigal-do--active-actions)
+      (madrigal-do--ensure-spinner-timer)
+      (force-mode-line-update t)
       (condition-case err
           (let ((handle
                  (madrigal-agent-controller-submit-async
                   :agent madrigal-do-agent
                   :history (list (list :role 'user :content instruction))
                   :context (madrigal-focus-render-context context)
+                  :response-format madrigal-do--action-response-schema
                   :environment (list :buffer buffer
                                      :request-id id
                                      :event-sink event-sink
@@ -532,17 +774,29 @@ INDICATOR, when non-nil, is transferred from a DWIM suggestion request."
                                  :kind (if final 'summary 'intermediate)
                                  :text text :final final :at (current-time)))))
                         (when final
-                          (setf (madrigal-action-response action)
-                                (madrigal-do--brief-summary text))))))
+                          (condition-case parse-error
+                              (let ((response
+                                     (madrigal-do--parse-action-response text)))
+                                (setf (madrigal-action-response-kind action)
+                                      (plist-get response :kind)
+                                      (madrigal-action-response-name action)
+                                      (plist-get response :name)
+                                      (madrigal-action-response action)
+                                      (plist-get response :content)))
+                            (error
+                             (setf (madrigal-action-error action) parse-error)))))))
                   :on-finished
                   (lambda (_event)
-                    (setf (madrigal-action-status action) 'finished
-                          (madrigal-action-response action)
-                          (or (madrigal-action-response action) "Action completed.")
+                    (setf (madrigal-action-status action)
+                          (if (madrigal-action-error action) 'error 'finished)
                           (madrigal-action-finished-at action) (current-time))
                     (madrigal-do--remember-completed action)
                     (madrigal-do--dispose-execution-buffer action)
-                    (madrigal-do--show-result action))
+                    (if (madrigal-action-error action)
+                        (message "Madrigal returned an invalid response: %s"
+                                 (error-message-string
+                                  (madrigal-action-error action)))
+                      (madrigal-do--show-result action)))
                   :on-error
                   (lambda (event)
                     (setf (madrigal-action-status action) 'error
@@ -567,7 +821,9 @@ INDICATOR, when non-nil, is transferred from a DWIM suggestion request."
         (error
          (madrigal-do--delete-request-indicator
           (madrigal-action-indicator action))
+         (setf (madrigal-action-status action) 'error)
          (setq madrigal-do--active-actions (delq action madrigal-do--active-actions))
+         (madrigal-do--add-mode-line-feedback action "✗")
          (madrigal-do--dispose-execution-buffer action)
          (signal (car err) (cdr err))))
       action)))
@@ -633,52 +889,105 @@ INDICATOR may be created before reading the interactive instruction."
                               (string< (symbol-name left) (symbol-name right))))))
     (error "Invalid Madrigal %s fields" description)))
 
-(defun madrigal-do--suggestion-string (entry key)
-  "Return non-empty string KEY from suggestion ENTRY."
+(defun madrigal-do--suggestion-string (entry key limit)
+  "Return trimmed string KEY from ENTRY, bounded by LIMIT."
   (let ((value (plist-get entry key)))
-    (unless (and (stringp value) (not (string-empty-p (string-trim value))))
+    (unless (and (stringp value)
+                 (not (string-empty-p (string-trim value)))
+                 (<= (length value) limit))
       (error "Invalid Madrigal suggestion field %s" key))
     (string-trim value)))
 
+(defun madrigal-do--validate-direct-tool-call (tool-call)
+  "Validate and return a copy of restricted TOOL-CALL."
+  (madrigal-do--require-json-keys tool-call '(:name :arguments) "tool call")
+  (unless (equal (plist-get tool-call :name) "eval")
+    (error "Invalid Madrigal direct tool"))
+  (let ((arguments (plist-get tool-call :arguments)))
+    (madrigal-do--require-json-keys arguments '(:source) "tool call arguments")
+    (list :name "eval"
+          :arguments
+          (list :source
+                (madrigal-do--suggestion-string
+                 arguments :source madrigal-do--direct-source-limit)))))
+
+(defun madrigal-do--parse-suggestion (entry)
+  "Validate one action or prompt suggestion ENTRY."
+  (let ((relevance (plist-get entry :relevance)))
+    (unless (and (numberp relevance) (<= 0 relevance) (<= relevance 1))
+      (error "Invalid Madrigal suggestion relevance"))
+    (cond
+     ((plist-member entry :action)
+      (madrigal-do--require-json-keys entry '(:relevance :action) "suggestion")
+      (let ((action (plist-get entry :action)))
+        (madrigal-do--require-json-keys
+         action '(:description :tool_call) "action")
+        (madrigal-action-suggestion-create
+         :relevance relevance
+         :action
+         (list :description
+               (madrigal-do--suggestion-string
+                action :description madrigal-do--suggestion-description-limit)
+               :tool-call
+               (madrigal-do--validate-direct-tool-call
+                (plist-get action :tool_call))))))
+     ((plist-member entry :prompt)
+      (madrigal-do--require-json-keys entry '(:relevance :prompt) "suggestion")
+      (madrigal-action-suggestion-create
+       :relevance relevance
+       :prompt (madrigal-do--suggestion-string
+                entry :prompt madrigal-do--suggestion-prompt-limit)))
+     (t (error "Invalid Madrigal suggestion alternative")))))
+
 (defun madrigal-do--parse-suggestions (text)
-  "Parse and validate structured DWIM suggestions from JSON TEXT."
+  "Parse TEXT, discarding malformed candidates independently."
   (let* ((object (json-parse-string
                   (madrigal-do--json-response-text text)
-                  :object-type 'plist
-                  :array-type 'list
-                  :null-object nil
-                  :false-object nil))
-         (entries (plist-get object :suggestions)))
+                  :object-type 'plist :array-type 'list
+                  :null-object nil :false-object nil))
+         (entries (plist-get object :suggestions))
+         (seen (make-hash-table :test #'equal))
+         suggestions diagnostics)
     (madrigal-do--require-json-keys object '(:suggestions) "response")
-    (unless (listp entries)
+    (unless (and (listp entries)
+                 (<= (length entries) madrigal-do--suggestion-max-count))
       (error "Invalid Madrigal suggestions array"))
-    (sort
-     (mapcar
-      (lambda (entry)
-        (madrigal-do--require-json-keys
-         entry '(:relevance :action) "suggestion")
-        (let ((relevance (plist-get entry :relevance))
-              (action (madrigal-do--suggestion-string entry :action)))
-          (unless (and (numberp relevance) (<= 0 relevance) (<= relevance 1))
-            (error "Invalid Madrigal suggestion relevance"))
-          (when (> (length action) 80)
-            (error "Madrigal suggestion action exceeds 80 characters"))
-          (madrigal-action-suggestion-create
-           :relevance relevance
-           :action action)))
-      entries)
-     (lambda (left right)
-       (> (madrigal-action-suggestion-relevance left)
-          (madrigal-action-suggestion-relevance right))))))
+    (cl-loop for entry in entries for index from 0 do
+             (condition-case err
+                 (let* ((suggestion (madrigal-do--parse-suggestion entry))
+                        (label (madrigal-do--suggestion-label suggestion)))
+                   (if (gethash label seen)
+                       (error "Duplicate Madrigal suggestion")
+                     (puthash label t seen)
+                     (push suggestion suggestions)))
+               (error
+                (when (< (length diagnostics) madrigal-do--diagnostic-limit)
+                  (push (madrigal-suggestion-diagnostic-create
+                         :index index
+                         :message (truncate-string-to-width
+                                   (error-message-string err) 160 nil nil "…"))
+                        diagnostics)))))
+    (setq madrigal-do--last-suggestion-diagnostics (nreverse diagnostics))
+    (sort suggestions
+          (lambda (left right)
+            (> (madrigal-action-suggestion-relevance left)
+               (madrigal-action-suggestion-relevance right))))))
+
+(defun madrigal-do--suggestion-label (suggestion)
+  "Return SUGGESTION's plain completion label."
+  (if-let* ((action (madrigal-action-suggestion-action suggestion)))
+      (plist-get action :description)
+    (madrigal-action-suggestion-prompt suggestion)))
+
+(defun madrigal-do--suggestion-action-p (suggestion)
+  "Return non-nil when SUGGESTION is an immediate action."
+  (not (null (madrigal-action-suggestion-action suggestion))))
 
 (defun madrigal-do--relevance-indicator (relevance)
   "Return a pie-circle indicator for RELEVANCE."
   (cond
-   ((>= relevance 0.875) "●")
-   ((>= relevance 0.625) "◕")
-   ((>= relevance 0.375) "◑")
-   ((>= relevance 0.125) "◔")
-   (t "○")))
+   ((>= relevance 0.875) "●") ((>= relevance 0.625) "◕")
+   ((>= relevance 0.375) "◑") ((>= relevance 0.125) "◔") (t "○")))
 
 (defun madrigal-do--org-fontify-string (text)
   "Return TEXT with Org inline formatting properties."
@@ -689,47 +998,57 @@ INDICATOR may be created before reading the interactive instruction."
       (font-lock-ensure))
     (buffer-substring (point-min) (point-max))))
 
-(defun madrigal-do--suggestion-display (suggestion)
-  "Return SUGGESTION as an Org-formatted completion candidate."
+(defun madrigal-do--suggestion-prefix (suggestion)
+  "Return the relevance and kind prefix for SUGGESTION."
   (let* ((relevance (madrigal-action-suggestion-relevance suggestion))
          (face (cond ((>= relevance 0.75) 'success)
-                     ((>= relevance 0.4) 'warning)
-                     (t 'shadow))))
+                     ((>= relevance 0.4) 'warning) (t 'shadow)))
+         (icon (if (madrigal-do--suggestion-action-p suggestion) "⚡" "🧠")))
     (concat (propertize (madrigal-do--relevance-indicator relevance) 'face face)
-            " "
-            (madrigal-do--org-fontify-string
-             (madrigal-action-suggestion-action suggestion)))))
+            " " icon " ")))
+
+(defun madrigal-do--suggestion-display (suggestion)
+  "Return SUGGESTION in its completion display format."
+  (concat (madrigal-do--suggestion-prefix suggestion)
+          (madrigal-do--org-fontify-string
+           (madrigal-do--suggestion-label suggestion))))
 
 (defun madrigal-do--suggestion-completion-table (candidates)
   "Return a categorized completion table for DWIM CANDIDATES."
   (lambda (string pred action)
     (if (eq action 'metadata)
-        '(metadata
+        `(metadata
           (category . madrigal-dwim-suggestion)
           (display-sort-function . identity)
-          (cycle-sort-function . identity))
+          (cycle-sort-function . identity)
+          (affixation-function
+           . ,(lambda (labels)
+                (mapcar
+                 (lambda (label)
+                   (list label
+                         (madrigal-do--suggestion-prefix
+                          (cdr (assoc label candidates)))
+                         ""))
+                 labels))))
       (complete-with-action action (mapcar #'car candidates) string pred))))
 
 (defun madrigal-do--read-suggestion (context suggestions)
-  "Read an action from SUGGESTIONS for CONTEXT."
+  "Read a candidate or custom instruction from SUGGESTIONS for CONTEXT."
   (let* ((context (madrigal-focus-normalize-context context))
          (buffer (madrigal-focus-context-origin-buffer context))
          (project (plist-get context :project))
-         (candidates
-          (mapcar (lambda (suggestion)
-                    (cons (madrigal-do--suggestion-display suggestion) suggestion))
-                  suggestions))
+         (candidates (mapcar (lambda (suggestion)
+                               (cons (madrigal-do--suggestion-label suggestion)
+                                     suggestion))
+                             suggestions))
          (choice (completing-read
                   (if buffer
-                      (format "Madrigal action for %s (type or choose): "
-                              (buffer-name buffer))
-                    (format "Madrigal project action for %s (type or choose): "
+                      (format "Madrigal for %s (type or choose): " (buffer-name buffer))
+                    (format "Madrigal project %s (type or choose): "
                             (plist-get project :name)))
                   (madrigal-do--suggestion-completion-table candidates) nil nil)))
     (unless (string-empty-p choice)
-      (if-let* ((suggestion (cdr (assoc choice candidates))))
-          (madrigal-action-suggestion-action suggestion)
-        choice))))
+      (or (cdr (assoc choice candidates)) choice))))
 
 (defun madrigal-do--suggestion-focus-range (context)
   "Return the source range included for CONTEXT's DWIM suggestions."
@@ -794,10 +1113,9 @@ INDICATOR may be created before reading the interactive instruction."
       (pp-to-string
        (list :instructions
              (list instructions
-                   "Return as many suggestions as are relevant, including none when appropriate, ordered by decreasing relevance."
-                   "Do not perform an action. Return only JSON matching the response schema."
-                   "Each action must be standalone and at most 80 characters. Use Org inline markup, such as =code= and *emphasis*, when it improves readability. Do not use Markdown.")
-             :response-schema madrigal-do--suggestion-response-schema
+                   "Return a small set ordered by decreasing relevance."
+                   "Use action for one independently executable eval operation; use prompt for a Madrigal question, investigation, explanation, or plan."
+                   "Do not perform an action or emit tool calls. Return only the requested structured response.")
              :context planning-context))))))
 
 (defun madrigal-do--suggestion-prompt (action-context &optional rendered-context)
@@ -823,8 +1141,137 @@ RENDERED-CONTEXT, when non-nil, is the prepared suggestion context."
       (llm-chat-streaming provider prompt nil success error t)
     (llm-chat-async provider prompt success error t)))
 
+(defun madrigal-do--immediate-value-text (value)
+  "Return VALUE for direct echo-area presentation."
+  (if (stringp value) value (madrigal--format-elisp-value value)))
+
+(defun madrigal-do--immediate-error-text (error-data)
+  "Return ERROR-DATA for direct echo-area presentation."
+  (condition-case nil
+      (error-message-string error-data)
+    (error (format "%s" error-data))))
+
+(defun madrigal-do--set-immediate-tool-result (operation text)
+  "Store unwrapped TEXT in OPERATION's completed tool event."
+  (when-let* ((event (car (last (madrigal-immediate-action-tool-events operation)))))
+    (setf (madrigal-tool-event-result event) text)))
+
+(defun madrigal-do--execute-immediate (context suggestion)
+  "Execute SUGGESTION's single tool call directly against CONTEXT."
+  (let* ((context (madrigal-focus-normalize-context context))
+         (tool-call
+          (madrigal-do--validate-direct-tool-call
+           (plist-get (madrigal-action-suggestion-action suggestion) :tool-call)))
+         (origin-buffer (madrigal-focus-context-origin-buffer context))
+         (project (plist-get context :project))
+         (buffer (or origin-buffer
+                     (let ((temporary
+                            (generate-new-buffer " *madrigal-project-immediate*")))
+                       (with-current-buffer temporary
+                         (setq default-directory (plist-get project :root)))
+                       temporary)))
+         (operation (madrigal-immediate-action-create
+                     :id (madrigal--next-request-id)
+                     :suggestion suggestion :context context :status 'running
+                     :started-at (current-time)))
+         raw-result
+         (sink (lambda (event)
+                 (when (eq (plist-get event :phase) 'finished)
+                   (setq raw-result (plist-get event :result)))
+                 (setf (madrigal-immediate-action-tool-events operation)
+                       (madrigal-do--updated-tool-events
+                        (madrigal-immediate-action-tool-events operation) event))))
+         (invoke
+          (lambda ()
+            (madrigal--run-eval-tool
+             "eval" buffer (madrigal-immediate-action-id operation)
+             #'ignore
+             (plist-get (plist-get tool-call :arguments) :source) sink))))
+    (unwind-protect
+        (condition-case err
+            (progn
+              (if origin-buffer
+                  (madrigal--call-with-focus-context context invoke)
+                (funcall invoke))
+              (if (plist-get raw-result :ok)
+                  (let ((text (madrigal-do--immediate-value-text
+                               (plist-get raw-result :value))))
+                    (setf (madrigal-immediate-action-status operation) 'finished
+                          (madrigal-immediate-action-result operation) text)
+                    (madrigal-do--set-immediate-tool-result operation text)
+                    (message "%s" text))
+                (let* ((error-data (or (plist-get raw-result :error)
+                                       '(error "Unknown eval failure")))
+                       (text (concat "❌ "
+                                     (madrigal-do--immediate-error-text error-data))))
+                  (setf (madrigal-immediate-action-status operation) 'error
+                        (madrigal-immediate-action-error operation) error-data
+                        (madrigal-immediate-action-result operation) text)
+                  (madrigal-do--set-immediate-tool-result operation text)
+                  (message "%s" text)))
+              (setf (madrigal-immediate-action-finished-at operation) (current-time)))
+          (error
+           (let ((text (concat "❌ " (error-message-string err))))
+             (setf (madrigal-immediate-action-status operation) 'error
+                   (madrigal-immediate-action-error operation) err
+                   (madrigal-immediate-action-result operation) text
+                   (madrigal-immediate-action-finished-at operation) (current-time))
+             (message "%s" text))))
+      (when (and (null origin-buffer) (buffer-live-p buffer))
+        (kill-buffer buffer))
+      (madrigal-do--remember-immediate-action operation))
+    operation))
+
+(defun madrigal-do--dispatch-suggestion (context selection indicator)
+  "Dispatch SELECTION against CONTEXT, transferring INDICATOR when needed."
+  (cond
+   ((stringp selection)
+    (madrigal-do--execute context selection 'dwim indicator))
+   ((madrigal-do--suggestion-action-p selection)
+    (unwind-protect
+        (madrigal-do--execute-immediate context selection)
+      (madrigal-do--delete-request-indicator indicator)))
+   (t
+    (madrigal-do--execute
+     context
+     (madrigal-action-suggestion-prompt selection)
+     'dwim indicator))))
+
+(defun madrigal-do--offer-suggestions (request context suggestions text)
+  "Offer SUGGESTIONS for REQUEST and dispatch a selection against CONTEXT."
+  (unless (madrigal-dwim-suggestion-request-finished-at request)
+    (condition-case visit-error
+        (progn
+          (madrigal-do--visit-context context)
+          (if-let* ((selection (madrigal-do--read-suggestion context suggestions)))
+              (progn
+                (madrigal-do--finish-dwim-suggestion request 'success text nil t)
+                (madrigal-do--dispatch-suggestion
+                 context selection
+                 (madrigal-dwim-suggestion-request-indicator request)))
+            (madrigal-do--finish-dwim-suggestion request 'success text)))
+      (user-error
+       (madrigal-do--finish-dwim-suggestion request 'error text visit-error)
+       (message "%s" (error-message-string visit-error)))
+      (quit
+       (madrigal-do--finish-dwim-suggestion request 'cancelled text)
+       (signal 'quit nil)))))
+
+(defun madrigal-do--offer-suggestions-when-minibuffer-free
+    (request context suggestions text)
+  "Offer SUGGESTIONS once no unrelated minibuffer is active."
+  (unless (madrigal-dwim-suggestion-request-finished-at request)
+    (if (active-minibuffer-window)
+        (progn
+          (setf (madrigal-dwim-suggestion-request-status request)
+                'waiting-for-minibuffer)
+          (run-at-time
+           0.1 nil #'madrigal-do--offer-suggestions-when-minibuffer-free
+           request context suggestions text))
+      (madrigal-do--offer-suggestions request context suggestions text))))
+
 (defun madrigal-do-dwim (action-context)
-  "Suggest likely actions for plist ACTION-CONTEXT and execute one."
+  "Suggest immediate actions and prompts for plist ACTION-CONTEXT."
   (interactive
    (list (madrigal-focus-context
           nil nil madrigal-do-dwim-context-limit)))
@@ -854,36 +1301,22 @@ RENDERED-CONTEXT, when non-nil, is the prepared suggestion context."
                    (unwind-protect
                        (condition-case parse-error
                        (let ((suggestions (madrigal-do--parse-suggestions text)))
+                         (setf (madrigal-dwim-suggestion-request-diagnostics request)
+                               madrigal-do--last-suggestion-diagnostics)
                          (if (null suggestions)
                              (progn
                                (madrigal-do--finish-dwim-suggestion request 'success text)
                                (message "Madrigal found no likely actions"))
-                           (condition-case visit-error
-                               (progn
-                                 (madrigal-do--visit-context action-context)
-                                 (if-let* ((instruction
-                                            (madrigal-do--read-suggestion action-context suggestions)))
-                                     (progn
-                                       (madrigal-do--finish-dwim-suggestion
-                                        request 'success text nil t)
-                                       (madrigal-do--execute
-                                        action-context instruction 'dwim
-                                        (madrigal-dwim-suggestion-request-indicator request)))
-                                   (madrigal-do--finish-dwim-suggestion request 'success text)))
-                             (user-error
-                              (madrigal-do--finish-dwim-suggestion
-                               request 'error text visit-error)
-                              (message "%s" (error-message-string visit-error)))
-                             (quit
-                              (madrigal-do--finish-dwim-suggestion
-                               request 'cancelled text)
-                              (signal 'quit nil)))))
+                           (madrigal-do--offer-suggestions-when-minibuffer-free
+                            request action-context suggestions text)))
                          (error
                           (madrigal-do--finish-dwim-suggestion
                            request 'invalid-response text parse-error)
                           (message "Madrigal returned invalid action suggestions: %s"
                                    (error-message-string parse-error))))
-                     (unless (madrigal-dwim-suggestion-request-finished-at request)
+                     (unless (or (madrigal-dwim-suggestion-request-finished-at request)
+                                 (eq (madrigal-dwim-suggestion-request-status request)
+                                     'waiting-for-minibuffer))
                        (madrigal-do--finish-dwim-suggestion
                         request 'cancelled text)))))
                (lambda (_type message)
@@ -1195,6 +1628,14 @@ TIME-FUNCTION and STATUS-FUNCTION extract annotation data from each record."
         (insert "* Response\n")
         (madrigal-do--insert-fixed-width
          (madrigal-dwim-suggestion-request-response request))
+        (when-let* ((diagnostics
+                     (madrigal-dwim-suggestion-request-diagnostics request)))
+          (insert "* Discarded candidates\n")
+          (dolist (diagnostic diagnostics)
+            (madrigal-do--insert-fixed-width
+             (format "%d: %s"
+                     (madrigal-suggestion-diagnostic-index diagnostic)
+                     (madrigal-suggestion-diagnostic-message diagnostic)))))
         (when-let* ((error (madrigal-dwim-suggestion-request-error request)))
           (insert "* Error\n")
           (madrigal-do--insert-fixed-width (format "%s" error)))
@@ -1208,6 +1649,75 @@ TIME-FUNCTION and STATUS-FUNCTION extract annotation data from each record."
   (interactive)
   (madrigal-do--render-dwim-history
    (or request (madrigal-do--read-dwim-history-request))))
+
+(defun madrigal-do--immediate-history-candidate (operation)
+  "Return a compact completion label for immediate OPERATION."
+  (let* ((suggestion (madrigal-immediate-action-suggestion operation))
+         (description (madrigal-do--suggestion-label suggestion)))
+    (concat
+     (propertize (or description "Immediate action")
+                 'face 'font-lock-variable-name-face)
+     "  "
+     (propertize
+      (format "[%s]" (madrigal-immediate-action-id operation))
+      'face 'shadow))))
+
+(defun madrigal-do--read-immediate-history-operation ()
+  "Read a retained immediate operation, newest first."
+  (unless madrigal-do--recent-immediate-actions
+    (user-error "No Madrigal immediate actions"))
+  (let* ((candidates
+          (mapcar (lambda (operation)
+                    (cons (madrigal-do--immediate-history-candidate operation)
+                          operation))
+                  madrigal-do--recent-immediate-actions))
+         (default (caar candidates))
+         (table
+          (madrigal-do--history-completion-table
+           candidates 'madrigal-do-immediate-history
+           #'madrigal-immediate-action-started-at
+           #'madrigal-immediate-action-status))
+         (choice (completing-read "Madrigal immediate history: " table nil t
+                                  nil nil default)))
+    (cdr (assoc choice candidates))))
+
+(defun madrigal-do--render-immediate-history (operation)
+  "Render immediate OPERATION in a read-only Org buffer."
+  (let ((buffer (get-buffer-create
+                 (format "*Madrigal Immediate: %s*"
+                         (madrigal-immediate-action-id operation)))))
+    (with-current-buffer buffer
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (org-mode)
+        (insert (format "#+title: Madrigal immediate action %s\n\n"
+                        (madrigal-immediate-action-id operation)))
+        (insert "* Action\n")
+        (insert (madrigal-do--suggestion-label
+                 (madrigal-immediate-action-suggestion operation))
+                "\n")
+        (insert (format "- Status :: %s\n"
+                        (madrigal-immediate-action-status operation)))
+        (when-let* ((context (madrigal-immediate-action-context operation)))
+          (madrigal-do--insert-history-context context))
+        (insert "* Tool\n** Events\n")
+        (dolist (event (madrigal-immediate-action-tool-events operation))
+          (madrigal-do--insert-history-tool event))
+        (unless (madrigal-immediate-action-tool-events operation)
+          (insert "* Result\n")
+          (madrigal-do--insert-fixed-width
+           (madrigal-immediate-action-result operation)))
+        (goto-char (point-min))
+        (font-lock-ensure)
+        (local-set-key (kbd "q") #'quit-window)
+        (setq buffer-read-only t)))
+    (display-buffer buffer)))
+
+(defun madrigal-do-immediate-history (&optional operation)
+  "Select and display a retained immediate DWIM OPERATION."
+  (interactive)
+  (madrigal-do--render-immediate-history
+   (or operation (madrigal-do--read-immediate-history-operation))))
 
 (provide 'madrigal-do)
 

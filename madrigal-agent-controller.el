@@ -150,12 +150,14 @@
                                      event-sink focus-context request-context)))
             (or (madrigal--agent-tool-names agent-name) '()))))
 
-(defun madrigal-agent-controller-build-prompt (agent-name history context environment request-id)
+(defun madrigal-agent-controller-build-prompt
+    (agent-name history context environment request-id &optional response-format)
   "Build an llm prompt for AGENT-NAME from HISTORY and CONTEXT."
   (llm-make-chat-prompt
    (madrigal-agent-controller--history-to-llm-content history)
    :context (madrigal-agent-controller--context-string agent-name context)
-   :tools (madrigal-agent-controller--build-tools agent-name environment request-id)))
+   :tools (madrigal-agent-controller--build-tools agent-name environment request-id)
+   :response-format response-format))
 
 (defun madrigal-agent-controller--submit-prompt (handle)
   "Submit HANDLE's prompt asynchronously."
@@ -203,14 +205,14 @@
         (llm-chat-streaming provider prompt nil success-callback error-callback t)
       (llm-chat-async provider prompt success-callback error-callback t))))
 
-(cl-defun madrigal-agent-controller-submit-async (&key agent provider model history context
-                                                       environment on-start on-response
-                                                       on-finished on-error on-cancelled)
+(cl-defun madrigal-agent-controller-submit-async
+    (&key agent provider model history context response-format environment
+          on-start on-response on-finished on-error on-cancelled)
   "Submit an async Madrigal agent request and return its handle.
 
 Callers provide AGENT, conversation HISTORY, optional CONTEXT, ENVIRONMENT,
-and notification functions. PROVIDER and MODEL default to the named agent's
-configuration."
+and notification functions.  RESPONSE-FORMAT is passed to the provider.
+PROVIDER and MODEL default to the named agent's configuration."
   (unless (madrigal-llm-available-p)
     (user-error "The `llm' package is not available"))
   (unless agent
@@ -225,7 +227,8 @@ configuration."
                                     :finished on-finished :error on-error
                                     :cancelled on-cancelled))
                (prompt (madrigal-agent-controller-build-prompt
-                        agent history context environment request-id))
+                        agent history context environment request-id
+                        response-format))
                (handle (madrigal-agent-controller-handle-create
                         :id request-id :agent agent :provider provider :model model
                         :prompt prompt :environment environment

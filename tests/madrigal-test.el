@@ -444,6 +444,20 @@
                (regexp-quote "line 1")
                message)))))
 
+(ert-deftest madrigal-babel-lsp-diagnostics-does-not-leave-file-without-server ()
+  (skip-unless (featurep 'eglot))
+  (let ((directory (make-temp-file "madrigal-no-eglot-server-" t)))
+    (unwind-protect
+        (cl-letf (((symbol-function 'madrigal--babel-lsp-major-mode)
+                   (lambda (_language) 'fundamental-mode))
+                  ((symbol-function 'madrigal--babel-eglot-guess)
+                   (lambda (_mode _project) nil)))
+          (should-not
+           (madrigal--babel-lsp-diagnostics
+            "emacs-lisp" "(+ 1 2)" directory))
+          (should-not (file-exists-p (expand-file-name "main.el" directory))))
+      (delete-directory directory t))))
+
 (ert-deftest madrigal-babel-lsp-diagnostics-python-finds-errors ()
   (skip-unless (and (featurep 'eglot)
                     (madrigal--babel-lsp-major-mode "python")))
@@ -1432,6 +1446,29 @@
   (should (= 4096 (default-value 'madrigal-do-buffer-context-limit)))
   (should (= 4096 (default-value 'madrigal-do-dwim-context-limit))))
 
+(ert-deftest madrigal-focus-normalize-context-discards-changed-origin-window ()
+  (save-window-excursion
+    (let ((origin (generate-new-buffer " *madrigal-origin*"))
+          (other (generate-new-buffer " *madrigal-other*")))
+      (unwind-protect
+          (progn
+            (set-window-buffer (selected-window) origin)
+            (with-current-buffer origin
+              (insert "origin")
+              (goto-char (point-min)))
+            (let ((context (madrigal-focus-context origin (selected-window))))
+              (set-window-buffer (selected-window) other)
+              (setq context (madrigal-focus-normalize-context context))
+              (should-not (madrigal-focus-context-window context))
+              (let (executed-in)
+                (madrigal--call-with-focus-context
+                 context
+                 (lambda () (setq executed-in (current-buffer))))
+                (should (eq origin executed-in))
+                (should (eq other (window-buffer (selected-window)))))))
+        (kill-buffer origin)
+        (kill-buffer other)))))
+
 (ert-deftest madrigal-focus-plist-discovers-project-and-nests-buffer-metadata ()
   (with-temp-buffer
     (emacs-lisp-mode)
@@ -1664,18 +1701,19 @@
     (let ((default-directory temporary-file-directory)
           (madrigal-do--active-actions nil)
           (madrigal-do--recent-actions nil)
-          captured-history captured-context captured-environment)
+          captured-history captured-context captured-environment captured-format)
       (cl-letf (((symbol-function 'project-current) (lambda (&rest _) nil))
                 ((symbol-function 'madrigal-do--show-result) #'ignore)
                 ((symbol-function 'madrigal-agent-controller-submit-async)
                  (lambda (&rest args)
                    (setq captured-history (plist-get args :history)
                          captured-context (plist-get args :context)
-                         captured-environment (plist-get args :environment))
+                         captured-environment (plist-get args :environment)
+                         captured-format (plist-get args :response-format))
                    (funcall (plist-get args :on-start)
                             (list :model "model"))
                    (funcall (plist-get args :on-response)
-                            (list :text "Done" :final t))
+                            (list :text "{\"result\":{\"echo\":\"Done\"}}" :final t))
                    (funcall (plist-get args :on-finished) nil)
                    (madrigal-agent-controller-handle-create
                     :provider 'provider :model "model"))))
@@ -1683,6 +1721,8 @@
                (action (madrigal-do "Do the thing" context)))
           (should (equal 'finished (madrigal-action-status action)))
           (should (equal "Done" (madrigal-action-response action)))
+          (should (eq 'echo (madrigal-action-response-kind action)))
+          (should (eq madrigal-do--action-response-schema captured-format))
           (should (equal "Do the thing"
                          (plist-get (car captured-history) :content)))
           (should (string-match-p "Focused text" captured-context))
@@ -1738,7 +1778,46 @@
                          (plist-get (plist-get (cdr other-faces) :box) :color)))
       (should-not (equal (plist-get context :background)
                          (plist-get point :background)))
-      (should-not (equal "#cccc33334ccc" (plist-get box :color))))))
+      (should-not (equal "#cccc33334ccc" (plist-get box :color)))
+      (should (equal (plist-get context :background)
+                     (plist-get
+                      (madrigal-do--mode-line-face '(theme-accent . 0.5))
+                      :foreground))))))
+
+(ert-deftest madrigal-do-mode-line-shows-coloured-request-spinners ()
+  (let* ((first-face '(:foreground "#ff0000" :weight bold))
+         (second-face '(:foreground "#00ff00" :weight bold))
+         (first (madrigal-action-create
+                 :instruction "First" :ui-face first-face))
+         (second (madrigal-action-create
+                  :instruction "Second" :ui-face second-face))
+         (madrigal-do--active-actions (list second first))
+         (madrigal-do--mode-line-feedback nil)
+         (madrigal-do--spinner-index 0)
+         (text (madrigal-do--mode-line-string))
+         (first-spinner (string-match "⠋" text))
+         (second-spinner (string-match "⠋" text (1+ first-spinner))))
+    (should (string-prefix-p " 🧠 " text))
+    (should (equal first-face (get-text-property first-spinner 'face text)))
+    (should (equal second-face (get-text-property second-spinner 'face text)))))
+
+(ert-deftest madrigal-do-mode-line-completion-feedback-lasts-two-seconds ()
+  (let* ((action (madrigal-action-create
+                  :instruction "Done" :ui-face '(:foreground "#ff0000")))
+         (madrigal-do--active-actions nil)
+         (madrigal-do--mode-line-feedback nil)
+         scheduled-delay scheduled-callback)
+    (cl-letf (((symbol-function 'run-at-time)
+               (lambda (delay _repeat callback &rest _)
+                 (setq scheduled-delay delay
+                       scheduled-callback callback)
+                 'timer))
+              ((symbol-function 'force-mode-line-update) #'ignore))
+      (madrigal-do--add-mode-line-feedback action "✓")
+      (should (= 2 scheduled-delay))
+      (should (string-match-p "✓" (madrigal-do--mode-line-string)))
+      (funcall scheduled-callback)
+      (should-not (madrigal-do--mode-line-string)))))
 
 (ert-deftest madrigal-do-request-indicators-survive-edits-until-cleanup ()
   (with-temp-buffer
@@ -1835,7 +1914,7 @@
                  "(point)"))
       (should (string-match-p ":value 4" callback-result)))))
 
-(ert-deftest madrigal-do-keeps-only-final-text-as-summary ()
+(ert-deftest madrigal-do-keeps-only-final-structured-response ()
   (with-temp-buffer
     (let ((default-directory temporary-file-directory)
           (madrigal-do--active-actions nil)
@@ -1848,7 +1927,8 @@
                    (funcall (plist-get args :on-response)
                             '(:text "I will inspect first." :final nil))
                    (funcall (plist-get args :on-response)
-                            '(:text "  Updated   the buffer.\n" :final t))
+                            '(:text "{\"result\":{\"echo\":\"  Updated   the buffer.\\n\"}}"
+                              :final t))
                    (funcall (plist-get args :on-finished) nil)
                    (madrigal-agent-controller-handle-create
                     :provider 'provider :model "model"))))
@@ -1866,13 +1946,50 @@
                           (nth 2 (madrigal-action-turns action))))))))))
 
 (ert-deftest madrigal-do-displays-summary-only-in-minibuffer ()
-  (let ((action (madrigal-action-create :response "Updated the buffer."))
+  (let ((action (madrigal-action-create
+                 :response-kind 'echo :response "Updated the buffer."))
         displayed)
     (cl-letf (((symbol-function 'message)
                (lambda (format-string &rest args)
                  (setq displayed (apply #'format format-string args)))))
       (madrigal-do--show-result action))
     (should (equal "Madrigal: Updated the buffer." displayed))))
+
+(ert-deftest madrigal-do-parses-echo-and-document-responses ()
+  (should (equal '(:kind echo :content "Done")
+                 (madrigal-do--parse-action-response
+                  "{\"result\":{\"echo\":\"Done\"}}")))
+  (should (equal '(:kind document :name "Result" :content
+                   "#+title: Result\n\n* Details\nComplete")
+                 (madrigal-do--parse-action-response
+                  "{\"result\":{\"document\":{\"name\":\"Result\",\"content\":\"#+title: Result\\n\\n* Details\\nComplete\"}}}")))
+  (should (equal '(:kind document :name "Details" :content
+                   "* Details\nComplete")
+                 (madrigal-do--parse-action-response
+                  "{\"result\":{\"document\":{\"name\":\"Details\",\"content\":\"* Details\\nComplete\"}}}")))
+  (should-error
+   (madrigal-do--parse-action-response
+    "{\"result\":{\"echo\":\"Done\",\"document\":{\"name\":\"Details\",\"content\":\"* Details\"}}}")))
+
+(ert-deftest madrigal-do-pops-read-only-org-document-with-quit-binding ()
+  (let* ((action (madrigal-action-create
+                  :id "document-1" :response-kind 'document
+                  :response-name "Focused changes"
+                  :response "#+title: Result\n\n* Details\nComplete"))
+         displayed)
+    (cl-letf (((symbol-function 'pop-to-buffer)
+               (lambda (buffer &rest _) (setq displayed buffer))))
+      (madrigal-do--show-result action))
+    (unwind-protect
+        (with-current-buffer displayed
+          (should (equal "*Madrigal response: Focused changes*"
+                         (buffer-name)))
+          (should (derived-mode-p 'org-mode))
+          (should buffer-read-only)
+          (should (eq #'quit-window (key-binding (kbd "q"))))
+          (should (equal "#+title: Result\n\n* Details\nComplete"
+                         (buffer-string))))
+      (kill-buffer displayed))))
 
 (ert-deftest madrigal-do-history-default-retains-one-thousand-actions ()
   (should (= 1000 (default-value 'madrigal-do-history-length))))
@@ -2094,15 +2211,14 @@
       (should (= 1 (length (madrigal-do-tool-history action))))
       (should (= 1 (length (madrigal-do-tool-result-history action)))))))
 
-(ert-deftest madrigal-do-parses-and-sorts-structured-json-suggestions ()
+(ert-deftest madrigal-do-parses-and-sorts-action-and-prompt-suggestions ()
   (let ((suggestions
          (madrigal-do--parse-suggestions
-          "{\"suggestions\":[{\"relevance\":0.7,\"action\":\"Rename the symbol.\"},{\"relevance\":0.9,\"action\":\"Run the test at point.\"}]}")))
+          "{\"suggestions\":[{\"relevance\":0.7,\"prompt\":\"Explain the symbol at point.\"},{\"relevance\":0.9,\"action\":{\"description\":\"Run the test\",\"tool_call\":{\"name\":\"eval\",\"arguments\":{\"source\":\"(ert-run-test-at-point)\"}}}}]}")))
     (should (= 2 (length suggestions)))
-    (should (= 0.9
-               (madrigal-action-suggestion-relevance (car suggestions))))
-    (should (equal "Run the test at point."
-                   (madrigal-action-suggestion-action (car suggestions))))))
+    (should (madrigal-do--suggestion-action-p (car suggestions)))
+    (should (equal "Run the test"
+                   (madrigal-do--suggestion-label (car suggestions))))))
 
 (ert-deftest madrigal-do-parses-fenced-json-from-prompt-only-providers ()
   (should-not
@@ -2119,34 +2235,31 @@
    (madrigal-do--parse-suggestions
     "{\"suggestions\":[],\"commentary\":\"none\"}")))
 
-(ert-deftest madrigal-do-rejects-invalid-suggestion-relevance-and-length ()
-  (should-error
-   (madrigal-do--parse-suggestions
-    "{\"suggestions\":[{\"relevance\":1.1,\"action\":\"Act\"}]}"))
-  (should-error
-   (madrigal-do--parse-suggestions
-    (format "{\"suggestions\":[{\"relevance\":0.5,\"action\":\"%s\"}]}"
-            (make-string 81 ?a)))))
+(ert-deftest madrigal-do-discards-invalid-suggestions-independently ()
+  (let ((suggestions
+         (madrigal-do--parse-suggestions
+          "{\"suggestions\":[{\"relevance\":1.1,\"prompt\":\"Act\"},{\"relevance\":0.5,\"prompt\":\"Explain this.\"}]}")))
+    (should (= 1 (length suggestions)))
+    (should (= 1 (length madrigal-do--last-suggestion-diagnostics)))))
 
-(ert-deftest madrigal-do-suggestion-schema-requires-structured-fields ()
+(ert-deftest madrigal-do-suggestion-schema-is-a-bounded-sum-of-products ()
   (let* ((properties (plist-get madrigal-do--suggestion-response-schema
                                 :properties))
          (array (plist-get properties :suggestions))
-         (item (plist-get array :items)))
-    (should (equal ["relevance" "action"]
-                   (plist-get item :required)))
-    (should (= 80 (plist-get (plist-get (plist-get item :properties) :action)
-                              :maxLength)))
-    (should-not (plist-member array :maxItems))))
+         (alternatives (plist-get (plist-get array :items) :anyOf)))
+    (should (equal '(:suggestions) (madrigal-do--plist-keys properties)))
+    (should (= 8 (plist-get array :maxItems)))
+    (should (= 2 (length alternatives)))))
 
-(ert-deftest madrigal-do-suggestions-have-no-count-limit ()
+(ert-deftest madrigal-do-rejects-oversized-suggestion-arrays ()
   (let ((entries
          (mapconcat
-          (lambda (_)
-            "{\"relevance\":0.5,\"action\":\"Act at point.\"}")
-          (number-sequence 1 6) ",")))
-    (should (= 6 (length (madrigal-do--parse-suggestions
-                          (format "{\"suggestions\":[%s]}" entries)))))))
+          (lambda (index)
+            (format "{\"relevance\":0.5,\"prompt\":\"Explain item %d.\"}" index))
+          (number-sequence 1 9) ",")))
+    (should-error
+     (madrigal-do--parse-suggestions
+      (format "{\"suggestions\":[%s]}" entries)))))
 
 (ert-deftest madrigal-do-suggestion-context-is-local-to-point ()
   (with-temp-buffer
@@ -2201,7 +2314,7 @@
         (should (overlay-buffer (car indicator)))
         (condition-case nil
             (funcall success
-                     "{\"suggestions\":[{\"relevance\":1,\"action\":\"Act\"}]}")
+                     "{\"suggestions\":[{\"relevance\":1,\"prompt\":\"Act\"}]}")
           (quit nil))
         (should (eq 'cancelled
                     (madrigal-dwim-suggestion-request-status request)))
@@ -2214,7 +2327,7 @@
                      (list :origin (list :buffer (current-buffer)))))
            (suggestions
             (list (madrigal-action-suggestion-create
-                   :relevance 0.9 :action "Use the suggestion.")))
+                   :relevance 0.9 :prompt "Use the suggestion.")))
            require-match)
       (cl-letf (((symbol-function 'completing-read)
                  (lambda (_prompt _collection _predicate required &rest _)
@@ -2227,9 +2340,11 @@
 (ert-deftest madrigal-do-formats-suggestions-for-completion ()
   (let ((suggestion
          (madrigal-action-suggestion-create
-          :relevance 0.9 :action "Run the test.")))
+          :relevance 0.9
+          :action '(:description "Run the test."
+                    :tool-call (:name "eval" :arguments (:source "(test)"))))))
     (let ((display (madrigal-do--suggestion-display suggestion)))
-      (should (equal "● Run the test." display))
+      (should (equal "● ⚡ Run the test." display))
       (should (get-text-property 0 'face display))
       (should-not (get-text-property 2 'face display)))
     (let* ((formatted (madrigal-do--org-fontify-string "Run =make test= now"))
@@ -2240,12 +2355,110 @@
     (should (equal '("●" "◕" "◑" "◔" "○")
                    (mapcar #'madrigal-do--relevance-indicator
                            '(1.0 0.7 0.5 0.2 0.0))))
-    (should (equal '(metadata
-                     (category . madrigal-dwim-suggestion)
-                     (display-sort-function . identity)
-                     (cycle-sort-function . identity))
-                   (funcall (madrigal-do--suggestion-completion-table nil)
-                            "" nil 'metadata)))))
+    (let ((metadata (funcall (madrigal-do--suggestion-completion-table nil)
+                             "" nil 'metadata))
+          (prompt (madrigal-action-suggestion-create
+                   :relevance 0.5 :prompt "Explain this.")))
+      (should (eq 'madrigal-dwim-suggestion
+                  (alist-get 'category (cdr metadata))))
+      (should (equal "◑ 🧠 Explain this."
+                     (madrigal-do--suggestion-display prompt))))))
+
+(ert-deftest madrigal-do-discards-malformed-invocations-and-duplicate-labels ()
+  (let ((suggestions
+         (madrigal-do--parse-suggestions
+          "{\"suggestions\":[{\"relevance\":1,\"action\":{\"description\":\"Change\",\"tool_call\":{\"name\":\"shell\",\"arguments\":{\"source\":\"echo no\"}}}},{\"relevance\":0.8,\"prompt\":\"Explain this.\"},{\"relevance\":0.7,\"prompt\":\"Explain this.\"}]}")))
+    (should (= 1 (length suggestions)))
+    (should (= 2 (length madrigal-do--last-suggestion-diagnostics)))))
+
+(ert-deftest madrigal-do-immediate-selection-invokes-eval-once-without-controller ()
+  (with-temp-buffer
+    (let* ((context (madrigal-focus-normalize-context
+                     (list :origin (list :buffer (current-buffer)))))
+           (suggestion
+            (madrigal-action-suggestion-create
+             :relevance 1
+             :action '(:description "Insert text"
+                       :tool-call (:name "eval"
+                                   :arguments (:source "(insert \"done\")")))))
+           (madrigal-do--recent-immediate-actions nil)
+           (eval-count 0)
+           operation displayed)
+      (cl-letf (((symbol-function 'madrigal-agent-controller-submit-async)
+                 (lambda (&rest _) (ert-fail "Unexpected controller request")))
+                ((symbol-function 'madrigal--run-eval-tool)
+                 (lambda (_tool _buffer _id callback _source sink)
+                   (setq eval-count (1+ eval-count))
+                   (funcall sink '(:phase started :id "tool" :name "eval"))
+                   (funcall sink '(:phase finished :id "tool" :name "eval"
+                                   :result (:ok t :value "ok")
+                                   :formatted-result "(:ok t :value ok)"))
+                   (funcall callback "(:ok t :value ok)")))
+                ((symbol-function 'message)
+                 (lambda (format-string &rest args)
+                   (setq displayed (apply #'format format-string args)))))
+        (setq operation
+              (madrigal-do--dispatch-suggestion context suggestion nil)))
+      (should (= 1 eval-count))
+      (should (equal "ok" displayed))
+      (should (equal "ok" (madrigal-immediate-action-result operation)))
+      (should (equal "ok"
+                     (madrigal-tool-event-result
+                      (car (madrigal-immediate-action-tool-events operation)))))
+      (should (eq 'finished (madrigal-immediate-action-status operation)))
+      (should-not madrigal-do--active-actions)
+      (should (= 1 (length madrigal-do--recent-immediate-actions))))))
+
+(ert-deftest madrigal-do-immediate-failure-shows-cross-and-error-text ()
+  (let ((text (concat "❌ "
+                      (madrigal-do--immediate-error-text
+                       '(void-variable missing)))))
+    (should (string-prefix-p "❌ " text))
+    (should (string-match-p "missing" text))))
+
+(ert-deftest madrigal-do-immediate-history-selects-and-renders-operations ()
+  (let* ((suggestion
+          (madrigal-action-suggestion-create
+           :relevance 1
+           :action '(:description "Insert text"
+                     :tool-call (:name "eval" :arguments (:source "(insert \"ok\")")))))
+         (event (madrigal-tool-event-create
+                 :id "tool-1" :name "eval" :language "emacs-lisp"
+                 :source "(insert \"ok\")" :result "ok"
+                 :started-at (current-time) :finished-at (current-time)))
+         (operation
+          (madrigal-immediate-action-create
+           :id "immediate-1" :suggestion suggestion :status 'finished
+           :result "ok" :tool-events (list event) :started-at (current-time)
+           :finished-at (current-time)))
+         (madrigal-do--recent-immediate-actions (list operation))
+         displayed)
+    (cl-letf (((symbol-function 'completing-read)
+               (lambda (_prompt collection &rest _)
+                 (car (all-completions "" collection))))
+              ((symbol-function 'display-buffer)
+               (lambda (buffer &rest _) (setq displayed buffer))))
+      (should (eq operation (madrigal-do--read-immediate-history-operation)))
+      (madrigal-do-immediate-history operation))
+    (unwind-protect
+        (with-current-buffer displayed
+          (should (derived-mode-p 'org-mode))
+          (should buffer-read-only)
+          (should (eq #'quit-window (key-binding (kbd "q"))))
+          (should (string-match-p "Insert text" (buffer-string)))
+          (should (string-match-p "(insert \\\"ok\\\")" (buffer-string)))
+          (should (string-match-p "ok" (buffer-string))))
+      (kill-buffer displayed))))
+
+(ert-deftest madrigal-do-prompt-selection-uses-ordinary-executor ()
+  (let ((suggestion
+         (madrigal-action-suggestion-create :prompt "Explain this."))
+        called)
+    (cl-letf (((symbol-function 'madrigal-do--execute)
+               (lambda (context instruction kind indicator)
+                 (setq called (list context instruction kind indicator)))))
+      (madrigal-do--dispatch-suggestion 'context suggestion 'indicator))
+    (should (equal '(context "Explain this." dwim indicator) called))))
 
 (ert-deftest madrigal-do-suggestions-stream-for-codex-oauth-providers ()
   (let (streamed)
@@ -2319,11 +2532,14 @@
           (should-not (llm-chat-prompt-temperature prompt))
           (should (eq 'none (llm-chat-prompt-reasoning prompt)))
           (should (string-match-p
-                   (regexp-quote "Return only JSON")
+                   (regexp-quote "Use action for one independently executable eval operation")
                    (llm-chat-prompt-context prompt)))
           (should (string-match-p
-                   (regexp-quote "Use Org inline markup")
-                   (llm-chat-prompt-context prompt))))))))
+                   (regexp-quote "Do not perform an action or emit tool calls")
+                   (llm-chat-prompt-context prompt)))
+          (should-not (string-match-p
+                       (regexp-quote ":response-schema")
+                       (llm-chat-prompt-context prompt))))))))
 
 (ert-deftest madrigal-open-session-works-outside-projects ()
   (let* ((directory (make-temp-file "madrigal-no-project-" t))
