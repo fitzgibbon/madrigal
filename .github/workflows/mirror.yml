@@ -19,6 +19,9 @@ jobs:
       - name: Check out GitHub mirror
         uses: actions/checkout@v4
 
+      - name: Install Pijul build dependency
+        run: sudo apt-get install --yes libsodium-dev
+
       - name: Install Pijul
         uses: fossdd/action-setup-pijul@dd2a43ca13393f17ae3938a10832d3c07ce70cc5 # v1
 
