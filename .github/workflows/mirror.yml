@@ -19,11 +19,11 @@ jobs:
       - name: Check out GitHub mirror
         uses: actions/checkout@v4
 
-      - name: Install Pijul build dependency
-        run: sudo apt-get install --yes libsodium-dev
+      - name: Install Nix
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
 
       - name: Install Pijul
-        uses: fossdd/action-setup-pijul@dd2a43ca13393f17ae3938a10832d3c07ce70cc5 # v1
+        run: nix profile install nixpkgs#pijul
 
       - name: Clone authoritative repository
         run: |
