@@ -2,7 +2,7 @@
 
 ;;; Code:
 
-(require 'madrigal-context)
+(require 'madrigal-conversation-context)
 (require 'madrigal-org)
 (require 'subr-x)
 

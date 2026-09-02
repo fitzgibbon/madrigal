@@ -3,7 +3,7 @@
 ;;; Code:
 
 (require 'madrigal-core)
-(require 'madrigal-focus)
+(require 'madrigal-context)
 (require 'madrigal-org)
 (require 'madrigal-tool-eval-prelude)
 (require 'org)
@@ -331,8 +331,9 @@
 - Inspect first using reflection functions when useful; do not guess.
 - Start with =madrigal-runtime-info=, =madrigal-project-info=, =madrigal-package-search=, =madrigal-feature-search=, =madrigal-symbol-search=, =madrigal-function-help=, =madrigal-variable-help=, =madrigal-key-binding-help=, or =madrigal-mode-help=.
 - Before writing reusable code, inspect =madrigal-persisted-elisp-info=; use =madrigal-persisted-elisp-help= or =madrigal-persisted-elisp-source= to reuse or revise a definition.
-- Use =madrigal-focus-buffer-text= to retrieve omitted origin-buffer text.
+- Use =madrigal-context-buffer-text= to retrieve omitted origin-buffer text.
 - During =madrigal-do= actions, inspect the request with =madrigal-do-context=, =madrigal-do-turn-history=, =madrigal-do-tool-history=, and =madrigal-do-tool-result-history=.
+- Use =madrigal-do-expand-context= with an enclosing candidate id from the selected scope metadata for an explicit read-only expansion.
 - Do not add defensive error checks or custom error messages unless you are debugging a previous failure; let errors fail visibly rather than hiding them with =ignore-errors=.
 - Keep returned values tiny, since they become model context.
 - Use =madrigal-session-state-get= and =madrigal-session-state-put= to persist values across eval calls.
@@ -407,9 +408,9 @@
   (madrigal--run-elisp-tool #'madrigal--persist-elisp tool-name buffer request-id
                             callback source event-sink))
 
-(defun madrigal--call-with-focus-context (context function)
+(defun madrigal--call-with-action-context (context function)
   "Call FUNCTION in CONTEXT's captured buffer and optional location."
-  (let* ((context (madrigal-focus-normalize-context context))
+  (let* ((context (madrigal-context-normalize context))
          (origin (plist-get context :origin))
          (buffer (plist-get origin :buffer))
          (buffer-context (plist-get origin :buffer-context))
@@ -450,7 +451,7 @@
       (funcall invoke))))
 
 (defun madrigal--make-tool (tool-name tool-definition buffer request-id
-                                      &optional event-sink focus-context request-context)
+                                      &optional event-sink action-context request-context)
   "Return an llm tool named TOOL-NAME from TOOL-DEFINITION." 
   (let ((runner (plist-get tool-definition :function)))
     (llm-make-tool
@@ -462,8 +463,8 @@
                                  (if event-sink
                                      (append args (list event-sink))
                                    args)))))
-                   (if focus-context
-                       (madrigal--call-with-focus-context focus-context invoke)
+                   (if action-context
+                       (madrigal--call-with-action-context action-context invoke)
                      (funcall invoke))))
      :name tool-name
      :description (with-current-buffer buffer
@@ -472,7 +473,7 @@
      :async (plist-get tool-definition :async))))
 
 (defun madrigal--make-eval-tool (buffer request-id
-                                        &optional event-sink focus-context request-context)
+                                        &optional event-sink action-context request-context)
   "Return the async eval tool for BUFFER and REQUEST-ID." 
   (madrigal--make-tool
    "eval"
@@ -480,7 +481,7 @@
    buffer
    request-id
    event-sink
-   focus-context
+   action-context
    request-context))
 
 (provide 'madrigal-tool-eval)

@@ -81,7 +81,7 @@
                                      (madrigal-project-context-root context))))
         (list :project nil :directory directory :file buffer-file-name)))))
 
-(defun madrigal-focus-buffer-text (&optional start end)
+(defun madrigal-context-buffer-text (&optional start end)
   "Return text from START to END in the eval origin buffer."
   (unless (buffer-live-p madrigal--eval-origin-buffer)
     (error "No active Madrigal eval origin buffer"))

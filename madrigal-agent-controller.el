@@ -140,14 +140,14 @@
   "Return llm tools for AGENT-NAME in ENVIRONMENT under REQUEST-ID."
   (let ((buffer (plist-get environment :buffer))
         (event-sink (plist-get environment :event-sink))
-        (focus-context (plist-get environment :focus-context))
+        (action-context (plist-get environment :action-context))
         (request-context (plist-get environment :request-context)))
     (mapcar (lambda (tool-name)
               (let ((tool-definition (madrigal--tool-definition tool-name)))
                 (unless tool-definition
                   (user-error "No Madrigal tool named %s for agent %s" tool-name agent-name))
                 (madrigal--make-tool tool-name tool-definition buffer request-id
-                                     event-sink focus-context request-context)))
+                                     event-sink action-context request-context)))
             (or (madrigal--agent-tool-names agent-name) '()))))
 
 (defun madrigal-agent-controller-build-prompt

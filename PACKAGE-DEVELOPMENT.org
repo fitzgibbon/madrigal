@@ -93,7 +93,7 @@ For every change Madrigal:
 2. Applies edits to canonical source using expected hashes to prevent lost
    updates.
 3. Parses and byte-compiles the changed package in a clean subprocess.
-4. Runs focused ERT tests and other configured checks.
+4. Runs targeted ERT tests and other configured checks.
 5. Loads the exact saved source into the live Emacs.
 6. Evaluates calls and exploratory expressions against the loaded package.
 7. Runs relevant live tests.
@@ -113,7 +113,7 @@ checks detect accidental dependencies on the current live session.
 When checks pass, Madrigal can:
 
 1. Show repository status and the complete diff.
-2. Record focused commits or Pijul changes.
+2. Record coherent commits or Pijul changes.
 3. Push a development branch with approval.
 4. Open and track a pull request.
 5. Record the exact submitted revision.

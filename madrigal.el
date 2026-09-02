@@ -20,14 +20,14 @@
 
 (require 'madrigal-core)
 (require 'madrigal-org)
-(require 'madrigal-context)
+(require 'madrigal-conversation-context)
 (require 'madrigal-tool-eval-prelude)
 (require 'madrigal-tool-eval)
 (require 'madrigal-tool-babel)
 (require 'madrigal-agent-controller)
 (require 'madrigal-org-compact)
 (require 'madrigal-submit)
-(require 'madrigal-focus)
+(require 'madrigal-context)
 (require 'madrigal-do)
 
 (madrigal--load-persistent-elisp)

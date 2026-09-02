@@ -5,7 +5,7 @@
 (require 'madrigal-agent-controller)
 (require 'madrigal-org)
 (require 'madrigal-org-compact)
-(require 'madrigal-context)
+(require 'madrigal-conversation-context)
 (require 'seq)
 (require 'subr-x)
 

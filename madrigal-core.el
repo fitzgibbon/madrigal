@@ -76,7 +76,7 @@ model name to use for that agent."
   "Fallback definition for the built-in do agent.")
 
 (defconst madrigal--do-dwim-agent-definition
-  '(:system-prompt "Suggest focused editor actions."
+  '(:system-prompt "Suggest editor actions."
                    :model-agent "assistant"
                    :tools nil)
   "Fallback definition for the built-in DWIM suggestion agent.")
@@ -99,7 +99,7 @@ model name to use for that agent."
      :model-agent "assistant"
      :tools ("eval" "persist-elisp"))
     ("do-dwim"
-     :system-prompt "Suggest focused editor actions."
+     :system-prompt "Suggest editor actions."
      :model-agent "assistant"
      :tools nil))
   "Named Madrigal agents.

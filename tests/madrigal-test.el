@@ -771,7 +771,7 @@
                         madrigal-variable-help
                         madrigal-key-binding-help
                         madrigal-mode-help
-                        madrigal-focus-buffer-text
+                        madrigal-context-buffer-text
                         madrigal-do-context
                         madrigal-do-turn-history
                         madrigal-do-tool-history
@@ -1417,36 +1417,8 @@
         (should (string-match-p "Working directory: /tmp/" context))
         (should (string-match-p "Project: none" context))))))
 
-(defun madrigal-test--captured-text (&optional limit)
-  (plist-get
-   (madrigal-focus-context-buffer-context
-    (madrigal-focus-capture (current-buffer) nil limit))
-   :text))
 
-(ert-deftest madrigal-focus-capture-includes-buffer-and-point ()
-  (with-temp-buffer
-    (insert "alpha beta gamma")
-    (goto-char 7)
-    (let ((default-directory temporary-file-directory))
-      (cl-letf (((symbol-function 'project-current) (lambda (&rest _) nil)))
-        (let* ((context (madrigal-focus-capture (current-buffer)))
-               (buffer-context (madrigal-focus-context-buffer-context context)))
-          (should (= 7 (marker-position (plist-get buffer-context :point))))
-          (should (equal "alpha beta gamma" (plist-get buffer-context :text)))
-          (should-not (plist-get context :project))
-          (let ((buffer-context
-                 (plist-get (plist-get context :origin) :buffer-context)))
-            (should-not (plist-member context :working-directory))
-            (should (eq 'fundamental-mode
-                        (plist-get buffer-context :major-mode)))
-            (should (listp (plist-get buffer-context :minor-modes)))
-            (should (markerp (plist-get buffer-context :point)))))))))
-
-(ert-deftest madrigal-focus-defaults-to-four-kibibyte-contexts ()
-  (should (= 4096 (default-value 'madrigal-do-buffer-context-limit)))
-  (should (= 4096 (default-value 'madrigal-do-dwim-context-limit))))
-
-(ert-deftest madrigal-focus-normalize-context-discards-changed-origin-window ()
+(ert-deftest madrigal-context-normalize-discards-changed-origin-window ()
   (save-window-excursion
     (let ((origin (generate-new-buffer " *madrigal-origin*"))
           (other (generate-new-buffer " *madrigal-other*")))
@@ -1456,12 +1428,12 @@
             (with-current-buffer origin
               (insert "origin")
               (goto-char (point-min)))
-            (let ((context (madrigal-focus-context origin (selected-window))))
+            (let ((context (madrigal-context origin (selected-window))))
               (set-window-buffer (selected-window) other)
-              (setq context (madrigal-focus-normalize-context context))
-              (should-not (madrigal-focus-context-window context))
+              (setq context (madrigal-context-normalize context))
+              (should-not (madrigal-context-window context))
               (let (executed-in)
-                (madrigal--call-with-focus-context
+                (madrigal--call-with-action-context
                  context
                  (lambda () (setq executed-in (current-buffer))))
                 (should (eq origin executed-in))
@@ -1469,157 +1441,25 @@
         (kill-buffer origin)
         (kill-buffer other)))))
 
-(ert-deftest madrigal-focus-plist-discovers-project-and-nests-buffer-metadata ()
-  (with-temp-buffer
-    (emacs-lisp-mode)
-    (let ((project 'fake-project)
-          (root (file-name-as-directory temporary-file-directory)))
-      (cl-letf (((symbol-function 'project-current)
-                 (lambda (&rest _) project))
-                ((symbol-function 'project-root)
-                 (lambda (_) root))
-                ((symbol-function 'project-name)
-                 (lambda (_) "fake")))
-        (let* ((context (madrigal-focus-context (current-buffer)))
-               (origin (plist-get context :origin))
-               (buffer-context (plist-get origin :buffer-context)))
-          (should (eq (current-buffer) (plist-get origin :buffer)))
-          (should (eq 'emacs-lisp-mode
-                      (plist-get buffer-context :major-mode)))
-          (should (listp (plist-get buffer-context :minor-modes)))
-          (should (markerp (plist-get buffer-context :point)))
-          (should (equal "fake" (plist-get (plist-get context :project) :name)))
-          (should-not (plist-member context :working-directory)))))))
 
-(ert-deftest madrigal-project-action-context-has-project-granularity ()
-  (let ((project 'fake-project)
-        (root (file-name-as-directory temporary-file-directory)))
-    (cl-letf (((symbol-function 'project-root) (lambda (_) root))
-              ((symbol-function 'project-name) (lambda (_) "fake")))
-      (let* ((context (madrigal-project-action-context project))
-             (model-context (madrigal-focus-model-context context)))
-        (should-not (plist-member context :origin))
-        (should-not (plist-member context :working-directory))
-        (should (equal "fake" (plist-get (plist-get context :project) :name)))
-        (should-not (plist-member (plist-get model-context :project) :object))))))
 
-(ert-deftest madrigal-custom-origin-point-is-optional-and-enables-highlighting ()
-  (with-temp-buffer
-    (insert "first\nsecond")
-    (let* ((whole (madrigal-focus-normalize-context
-                   (list :origin (list :buffer (current-buffer)))))
-           (focused (madrigal-focus-normalize-context
-                     (list :origin
-                           (list :buffer (current-buffer)
-                                 :buffer-context (list :point 2)))))
-           (indicator (madrigal-do--make-request-indicator focused)))
-      (unwind-protect
-          (progn
-            (should-not (madrigal-focus-context-point whole))
-            (should (markerp (madrigal-focus-context-point focused)))
-            (should (eq 'fundamental-mode
-                        (plist-get
-                         (plist-get (plist-get focused :origin) :buffer-context)
-                         :major-mode)))
-            (should (= 2 (length indicator))))
-        (madrigal-do--delete-request-indicator indicator)))))
 
-(ert-deftest madrigal-whole-buffer-context-widens-eval-execution ()
-  (skip-unless (madrigal-llm-available-p))
-  (with-temp-buffer
-    (insert "abcdef")
-    (narrow-to-region 3 5)
-    (let ((context (list :origin (list :buffer (current-buffer))))
-          result)
-      (let ((tool (madrigal--make-eval-tool
-                   (current-buffer) "whole" #'ignore context)))
-        (funcall (llm-tool-function tool)
-                 (lambda (value) (setq result value))
-                 "(cons (point-min) (point-max))"))
-      (should (string-match-p (regexp-quote ":value (1 . 7)") result)))))
 
-(ert-deftest madrigal-focus-capture-bounds-large-buffer-context ()
-  (with-temp-buffer
-    (insert (make-string 200 ?x))
-    (goto-char 100)
-    (let ((default-directory temporary-file-directory)
-          (madrigal-do-buffer-context-limit 40))
-      (cl-letf (((symbol-function 'project-current) (lambda (&rest _) nil)))
-        (let ((buffer-context
-               (madrigal-focus-context-buffer-context
-                (madrigal-focus-capture (current-buffer)))))
-          (should (= 40 (length (plist-get buffer-context :text))))
-          (should (= 200 (plist-get buffer-context :buffer-size))))))))
 
-(ert-deftest madrigal-focus-fallback-context-selects-complete-lines ()
-  (with-temp-buffer
-    (insert "row-1\nrow-2 target\nrow-3\nrow-4\n")
-    (search-backward "target")
-    (let ((default-directory temporary-file-directory))
-      (cl-letf (((symbol-function 'project-current) (lambda (&rest _) nil)))
-        (let ((text (madrigal-test--captured-text 25)))
-          (should (string-prefix-p "row-1\n" text))
-          (should (string-match-p "row-2 target" text))
-          (should (string-suffix-p "\n" text))
-          (should (<= (length text) 25)))))))
 
-(ert-deftest madrigal-focus-programming-context-selects-current-defun ()
-  (with-temp-buffer
-    (emacs-lisp-mode)
-    (insert "(defun first ()\n  1)\n\n(defun second ()\n  2)\n")
-    (search-backward "2")
-    (let ((default-directory temporary-file-directory))
-      (cl-letf (((symbol-function 'project-current) (lambda (&rest _) nil))
-                ((symbol-function 'treesit-parser-list) (lambda () nil)))
-        (let ((text (madrigal-test--captured-text 100)))
-          (should (string-match-p "defun second" text))
-          (should-not (string-match-p "defun first" text)))))))
 
-(ert-deftest madrigal-focus-outline-context-widens-to-fitting-parent ()
-  (with-temp-buffer
-    (insert "* Parent\nintro\n** Child\nbody\n** Sibling\nother\n")
-    (outline-mode)
-    (goto-char (point-min))
-    (search-forward "body")
-    (let ((default-directory temporary-file-directory))
-      (cl-letf (((symbol-function 'project-current) (lambda (&rest _) nil)))
-        (let ((text (madrigal-test--captured-text 100)))
-          (should (string-match-p "\\* Parent" text))
-          (should (string-match-p "\\*\\* Sibling" text)))
-        (let ((text (madrigal-test--captured-text 20)))
-          (should (string-match-p "\\*\\* Child" text))
-          (should-not (string-match-p "\\* Parent" text)))))))
 
-(ert-deftest madrigal-focus-magit-context-widens-to-fitting-parent-section ()
-  (skip-unless (require 'magit-section nil t))
-  (with-temp-buffer
-    (insert (make-string 100 ?x))
-    (let ((parent (make-instance 'magit-section))
-          (child (make-instance 'magit-section)))
-      (eieio-oset parent 'start 10)
-      (eieio-oset parent 'end 80)
-      (eieio-oset child 'start 30)
-      (eieio-oset child 'end 50)
-      (eieio-oset child 'parent parent)
-      (cl-letf (((symbol-function 'magit-current-section)
-                 (lambda () child)))
-        (should (equal '(10 . 80)
-                       (madrigal-focus--magit-section-context-range 40 80)))
-        (should (equal '(30 . 50)
-                       (madrigal-focus--magit-section-context-range 40 40)))))))
 
-(ert-deftest madrigal-focus-tabulated-context-selects-complete-nearby-lines ()
-  (with-temp-buffer
-    (tabulated-list-mode)
-    (let ((inhibit-read-only t))
-      (insert "row-1\nrow-2 target\nrow-3\nrow-4\n"))
-    (search-backward "target")
-    (let ((default-directory temporary-file-directory))
-      (cl-letf (((symbol-function 'project-current) (lambda (&rest _) nil)))
-        (let ((text (madrigal-test--captured-text 25)))
-          (should (string-match-p "row-2 target" text))
-          (should (string-suffix-p "\n" text))
-          (should (<= (length text) 25)))))))
+
+
+
+
+
+
+
+
+
+
 
 (ert-deftest madrigal-eval-tool-event-sink-avoids-org-rendering ()
   (skip-unless (madrigal-llm-available-p))
@@ -1637,28 +1477,11 @@
       (should (= 42 (plist-get (plist-get event :result) :value)))
       (should (string-match-p ":value 42" callback-result)))))
 
-(ert-deftest madrigal-do-and-dwim-use-independent-context-limits ()
-  (let ((madrigal-do-buffer-context-limit 123)
-        (madrigal-do-dwim-context-limit 234)
-        do-limit
-        dwim-limit)
-    (cl-letf (((symbol-function 'madrigal-focus-context)
-               (lambda (&optional _buffer _window limit)
-                 (if do-limit
-                     (setq dwim-limit limit)
-                   (setq do-limit limit))
-                 (list :project (list :name "test" :root "/tmp/"))))
-              ((symbol-function 'read-string) (lambda (&rest _) "Inspect"))
-              ((symbol-function 'madrigal-do--execute) #'ignore)
-              ((symbol-function 'madrigal-llm-available-p) (lambda () nil)))
-      (call-interactively #'madrigal-do)
-      (should-error (call-interactively #'madrigal-do-dwim) :type 'user-error)
-      (should (= 123 do-limit))
-      (should (= 234 dwim-limit)))))
+
 
 (ert-deftest madrigal-do-interactive-highlights-before-prompt-and-cleans-up-on-quit ()
   (with-temp-buffer
-    (insert "focused text")
+    (insert "context text")
     (goto-char 5)
     (let ((default-directory temporary-file-directory)
           seen-indicator)
@@ -1678,85 +1501,11 @@
         (should (overlayp seen-indicator))
         (should-not (overlay-buffer seen-indicator))))))
 
-(ert-deftest madrigal-do-interactive-discovers-optional-project-context ()
-  (with-temp-buffer
-    (let ((project 'fake-project)
-          (root (file-name-as-directory temporary-file-directory))
-          captured)
-      (cl-letf (((symbol-function 'project-current) (lambda (&rest _) project))
-                ((symbol-function 'project-root) (lambda (_) root))
-                ((symbol-function 'project-name) (lambda (_) "fake"))
-                ((symbol-function 'read-string) (lambda (&rest _) "Inspect"))
-                ((symbol-function 'madrigal-do--execute)
-                 (lambda (context instruction &rest _)
-                   (setq captured (list context instruction)))))
-        (call-interactively #'madrigal-do)
-        (should (equal "Inspect" (cadr captured)))
-        (should (equal "fake"
-                       (plist-get (plist-get (car captured) :project) :name)))))))
 
-(ert-deftest madrigal-do-executes-through-shared-controller-path ()
-  (with-temp-buffer
-    (insert "Focused text")
-    (let ((default-directory temporary-file-directory)
-          (madrigal-do--active-actions nil)
-          (madrigal-do--recent-actions nil)
-          captured-history captured-context captured-environment captured-format)
-      (cl-letf (((symbol-function 'project-current) (lambda (&rest _) nil))
-                ((symbol-function 'madrigal-do--show-result) #'ignore)
-                ((symbol-function 'madrigal-agent-controller-submit-async)
-                 (lambda (&rest args)
-                   (setq captured-history (plist-get args :history)
-                         captured-context (plist-get args :context)
-                         captured-environment (plist-get args :environment)
-                         captured-format (plist-get args :response-format))
-                   (funcall (plist-get args :on-start)
-                            (list :model "model"))
-                   (funcall (plist-get args :on-response)
-                            (list :text "{\"result\":{\"echo\":\"Done\"}}" :final t))
-                   (funcall (plist-get args :on-finished) nil)
-                   (madrigal-agent-controller-handle-create
-                    :provider 'provider :model "model"))))
-        (let* ((context (madrigal-focus-context (current-buffer)))
-               (action (madrigal-do "Do the thing" context)))
-          (should (equal 'finished (madrigal-action-status action)))
-          (should (equal "Done" (madrigal-action-response action)))
-          (should (eq 'echo (madrigal-action-response-kind action)))
-          (should (eq madrigal-do--action-response-schema captured-format))
-          (should (equal "Do the thing"
-                         (plist-get (car captured-history) :content)))
-          (should (string-match-p "Focused text" captured-context))
-          (should (functionp (plist-get captured-environment :event-sink)))
-          (should (= 1 (length madrigal-do--recent-actions))))))))
 
-(ert-deftest madrigal-do-project-executes-with-project-only-context ()
-  (let* ((root (make-temp-file "madrigal-do-project-" t))
-         (project 'fake-project)
-         (madrigal-do--active-actions nil)
-         (madrigal-do--recent-actions nil)
-         execution-buffer execution-directory rendered-context)
-    (unwind-protect
-        (cl-letf (((symbol-function 'project-root) (lambda (_) root))
-                  ((symbol-function 'project-name) (lambda (_) "fake"))
-                  ((symbol-function 'madrigal-do--show-result) #'ignore)
-                  ((symbol-function 'madrigal-agent-controller-submit-async)
-                   (lambda (&rest args)
-                     (setq rendered-context (plist-get args :context)
-                           execution-buffer
-                           (plist-get (plist-get args :environment) :buffer)
-                           execution-directory
-                           (buffer-local-value 'default-directory execution-buffer))
-                     (funcall (plist-get args :on-finished) nil)
-                     (madrigal-agent-controller-handle-create
-                      :provider 'provider :model "model"))))
-          (let* ((context (madrigal-project-action-context project))
-                 (action (madrigal-do "Inspect project" context)))
-            (should (equal (file-name-as-directory root) execution-directory))
-            (should-not (buffer-live-p execution-buffer))
-            (should-not (string-match-p ":origin" rendered-context))
-            (should-not (string-match-p ":major-mode" rendered-context))
-            (should-not (madrigal-action-indicator action))))
-      (delete-directory root t))))
+
+
+
 
 (ert-deftest madrigal-do-request-highlights-mix-rainbow-and-theme-colours ()
   (cl-letf (((symbol-function 'madrigal-do--face-rgb)
@@ -1784,6 +1533,18 @@
                       (madrigal-do--mode-line-face '(theme-accent . 0.5))
                       :foreground))))))
 
+(ert-deftest madrigal-do-mode-line-cache-is-safe-in-nested-formatting ()
+  (let ((madrigal-do--active-actions nil)
+        (madrigal-do--mode-line-feedback nil))
+    (madrigal-do--refresh-mode-line)
+    (should (stringp (car global-mode-string)))
+    (should (member madrigal-do--mode-line-entry global-mode-string))
+    (should-not
+     (string-match-p
+      "invalid"
+      (format-mode-line
+       `((:eval (format-mode-line ',global-mode-string))))))))
+
 (ert-deftest madrigal-do-mode-line-shows-coloured-request-spinners ()
   (let* ((first-face '(:foreground "#ff0000" :weight bold))
          (second-face '(:foreground "#00ff00" :weight bold))
@@ -1800,6 +1561,100 @@
     (should (string-prefix-p " 🧠 " text))
     (should (equal first-face (get-text-property first-spinner 'face text)))
     (should (equal second-face (get-text-property second-spinner 'face text)))))
+
+(ert-deftest madrigal-do-mode-line-action-spinner-visits-and-cancels-request ()
+  (let* ((context '(:scope (:target document)))
+         (action (madrigal-action-create
+                  :instruction "First" :context context :handle 'handle
+                  :ui-face '(:foreground "#ff0000")))
+         (madrigal-do--active-actions (list action))
+         (madrigal-do--active-dwim-suggestions nil)
+         (madrigal-do--mode-line-feedback nil)
+         (madrigal-do--spinner-index 0)
+         visited cancelled)
+    (cl-letf (((symbol-function 'madrigal-do--visit-context)
+               (lambda (value) (setq visited value)))
+              ((symbol-function 'madrigal-agent-controller-cancel)
+               (lambda (handle) (setq cancelled handle))))
+      (let* ((text (madrigal-do--mode-line-string))
+             (position (string-match "⠋" text))
+             (map (get-text-property position 'local-map text)))
+        (should (eq 'mode-line-highlight
+                    (get-text-property position 'mouse-face text)))
+        (funcall (lookup-key map [mode-line mouse-1]) nil)
+        (should (eq context visited))
+        (funcall (lookup-key map [mode-line mouse-3]) nil)
+        (should (eq 'handle cancelled))))))
+
+(ert-deftest madrigal-do-mode-line-suggestion-spinner-visits-and-cancels-request ()
+  (let* ((context '(:scope (:target document)))
+         (request (madrigal-dwim-suggestion-request-create
+                   :action-context context :handle 'request-handle
+                   :ui-face '(:foreground "#00ff00")))
+         (madrigal-do--active-actions nil)
+         (madrigal-do--active-dwim-suggestions (list request))
+         (madrigal-do--recent-dwim-suggestions nil)
+         (madrigal-do--mode-line-feedback nil)
+         (madrigal-do--spinner-index 0)
+         visited cancelled)
+    (cl-letf (((symbol-function 'madrigal-do--visit-context)
+               (lambda (value) (setq visited value)))
+              ((symbol-function 'llm-cancel-request)
+               (lambda (handle) (setq cancelled handle)))
+              ((symbol-function 'force-mode-line-update) #'ignore))
+      (let* ((text (madrigal-do--mode-line-string))
+             (position (string-match "⠋" text))
+             (map (get-text-property position 'local-map text)))
+        (funcall (lookup-key map [mode-line mouse-1]) nil)
+        (should (eq context visited))
+        (funcall (lookup-key map [mode-line mouse-3]) nil)
+        (should (eq 'request-handle cancelled))
+        (should (eq 'cancelled
+                    (madrigal-dwim-suggestion-request-status request)))))))
+
+(ert-deftest madrigal-do-mode-line-face-matches-point-highlight ()
+  (with-temp-buffer
+    (insert "alpha")
+    (goto-char 3)
+    (let* ((indicator (madrigal-do--make-request-indicator (madrigal-context)))
+           (point-face (get-text-property
+                        0 'face (overlay-get (cadr indicator) 'before-string)))
+           (mode-line-face (madrigal-do--indicator-mode-line-face indicator)))
+      (unwind-protect
+          (should (equal (plist-get (plist-get point-face :box) :color)
+                         (plist-get mode-line-face :foreground)))
+        (madrigal-do--delete-request-indicator indicator)))))
+
+(ert-deftest madrigal-do-mode-line-shows-suggestion-spinner ()
+  (let* ((face '(:foreground "#ff0000" :weight bold))
+         (request (madrigal-dwim-suggestion-request-create :ui-face face))
+         (madrigal-do--active-actions nil)
+         (madrigal-do--active-dwim-suggestions (list request))
+         (madrigal-do--mode-line-feedback nil)
+         (madrigal-do--spinner-index 0)
+         (text (madrigal-do--mode-line-string))
+         (spinner (string-match "⠋" text)))
+    (should spinner)
+    (should (equal face (get-text-property spinner 'face text)))))
+
+(ert-deftest madrigal-do-minibuffer-indicator-hides-suggestion-spinner-and-cleans-up ()
+  (let* ((face '(:foreground "#ff0000" :weight bold))
+         (request (madrigal-dwim-suggestion-request-create :ui-face face))
+         (madrigal-do--active-actions nil)
+         (madrigal-do--active-dwim-suggestions (list request))
+         (madrigal-do--mode-line-feedback nil)
+         (madrigal-do--spinner-index 0)
+         seen)
+    (condition-case nil
+        (madrigal-do--call-with-minibuffer-indicator
+         face (lambda ()
+                (setq seen (madrigal-do--mode-line-string))
+                (signal 'quit nil)))
+      (quit nil))
+    (should (string-match-p "?" seen))
+    (should-not (string-match-p "⠋" seen))
+    (should-not madrigal-do--minibuffer-face)
+    (should-not (string-match-p "?" madrigal-do--mode-line-construct))))
 
 (ert-deftest madrigal-do-mode-line-completion-feedback-lasts-two-seconds ()
   (let* ((action (madrigal-action-create
@@ -1827,7 +1682,7 @@
       (cl-letf (((symbol-function 'project-current) (lambda (&rest _) nil)))
         (let ((indicator
                (madrigal-do--make-request-indicator
-                (madrigal-focus-context (current-buffer)))))
+                (madrigal-context (current-buffer)))))
           (delete-region (point-min) (point-max))
           (insert "replacement")
           (should (overlay-buffer (car indicator)))
@@ -1846,12 +1701,12 @@
           (madrigal-do--request-face-index 0))
       (cl-letf (((symbol-function 'project-current) (lambda (&rest _) nil)))
         (goto-char (point-min))
-        (let* ((first (madrigal-focus-context (current-buffer)))
+        (let* ((first (madrigal-context (current-buffer)))
                (first-indicator (madrigal-do--make-request-indicator first)))
           (goto-char (point-max))
           (let ((second-indicator
                  (madrigal-do--make-request-indicator
-                  (madrigal-focus-context (current-buffer)))))
+                  (madrigal-context (current-buffer)))))
             (should (= 2 (length first-indicator)))
             (should (equal "🧠"
                            (substring-no-properties
@@ -1876,7 +1731,7 @@
             (should-not (overlay-buffer (car first-indicator)))
             (madrigal-do--delete-request-indicator second-indicator)))))))
 
-(ert-deftest madrigal-eval-tool-uses-captured-point-after-focus-moves ()
+(ert-deftest madrigal-eval-tool-uses-captured-point-after-point-moves ()
   (skip-unless (madrigal-llm-available-p))
   (with-temp-buffer
     (insert "abcdef")
@@ -1884,11 +1739,11 @@
     (let* ((default-directory temporary-file-directory)
            (context (cl-letf (((symbol-function 'project-current)
                                (lambda (&rest _) nil)))
-                      (madrigal-focus-context (current-buffer))))
+                      (madrigal-context (current-buffer))))
            callback-result)
       (goto-char 6)
       (let ((tool (madrigal--make-eval-tool
-                   (current-buffer) "do-focus" #'ignore context)))
+                   (current-buffer) "do-context" #'ignore context)))
         (funcall (llm-tool-function tool)
                  (lambda (value) (setq callback-result value))
                  "(point)"))
@@ -1902,13 +1757,13 @@
     (let* ((default-directory temporary-file-directory)
            (context (cl-letf (((symbol-function 'project-current)
                                (lambda (&rest _) nil)))
-                      (madrigal-focus-context (current-buffer))))
+                      (madrigal-context (current-buffer))))
            callback-result)
       (goto-char (point-min))
       (insert "X")
       (goto-char (point-max))
       (let ((tool (madrigal--make-eval-tool
-                   (current-buffer) "do-focus" #'ignore context)))
+                   (current-buffer) "do-context" #'ignore context)))
         (funcall (llm-tool-function tool)
                  (lambda (value) (setq callback-result value))
                  "(point)"))
@@ -1934,7 +1789,7 @@
                     :provider 'provider :model "model"))))
         (let ((action (madrigal-do
                        "Update it"
-                       (madrigal-focus-context (current-buffer)))))
+                       (madrigal-context (current-buffer)))))
           (should (equal "Updated the buffer."
                          (madrigal-action-response action)))
           (should (= 3 (length (madrigal-action-turns action))))
@@ -1974,7 +1829,7 @@
 (ert-deftest madrigal-do-pops-read-only-org-document-with-quit-binding ()
   (let* ((action (madrigal-action-create
                   :id "document-1" :response-kind 'document
-                  :response-name "Focused changes"
+                  :response-name "Context changes"
                   :response "#+title: Result\n\n* Details\nComplete"))
          displayed)
     (cl-letf (((symbol-function 'pop-to-buffer)
@@ -1982,7 +1837,7 @@
       (madrigal-do--show-result action))
     (unwind-protect
         (with-current-buffer displayed
-          (should (equal "*Madrigal response: Focused changes*"
+          (should (equal "*Madrigal response: Context changes*"
                          (buffer-name)))
           (should (derived-mode-p 'org-mode))
           (should buffer-read-only)
@@ -2060,43 +1915,14 @@
       (when (buffer-live-p buffer)
         (kill-buffer buffer)))))
 
-(ert-deftest madrigal-do-history-renders-the-captured-focus-context ()
-  (with-temp-buffer
-    (insert "Context sent to the agent")
-    (let ((default-directory temporary-file-directory)
-          buffer)
-      (cl-letf (((symbol-function 'project-current) (lambda (&rest _) nil))
-                ((symbol-function 'display-buffer)
-                 (lambda (value &rest _) (setq buffer value))))
-        (madrigal-do-history
-         (madrigal-action-create
-          :id "context-1" :instruction "Inspect"
-          :context (madrigal-focus-context (current-buffer))))
-        (unwind-protect
-            (with-current-buffer buffer
-              (should (string-match-p
-                       (regexp-quote
-                        "* Context\n#+begin_src emacs-lisp\n'(")
-                       (buffer-string)))
-              (should (string-match-p "Context sent to the agent" (buffer-string)))
-              (should (string-match-p ":buffer-context" (buffer-string)))
-              (goto-char (point-min))
-              (search-forward "#+begin_src emacs-lisp\n")
-              (let ((start (point)))
-                (search-forward "\n#+end_src")
-                (let ((form (read (buffer-substring-no-properties
-                                   start (match-beginning 0)))))
-                  (should (eq 'quote (car form)))
-                  (should (plist-get (cadr form) :origin)))))
-          (when (buffer-live-p buffer)
-            (kill-buffer buffer)))))))
+
 
 (ert-deftest madrigal-do-history-candidates-use-small-context-excerpts ()
   (with-temp-buffer
     (insert (make-string 200 ?a) "TEXT-AT-POINT" (make-string 200 ?z))
     (search-backward "TEXT-AT-POINT")
     (cl-letf (((symbol-function 'project-current) (lambda (&rest _) nil)))
-      (let* ((context (madrigal-focus-context (current-buffer)))
+      (let* ((context (madrigal-context (current-buffer)))
              (action (madrigal-action-create
                       :id "small-action" :instruction "Inspect this"
                       :context context :started-at (current-time)))
@@ -2127,8 +1953,7 @@
 (ert-deftest madrigal-do-dwim-history-allows-stale-origin-buffers ()
   (let* ((buffer (generate-new-buffer " *madrigal-stale-origin*"))
          (context (with-current-buffer buffer
-                    (madrigal-focus-normalize-context
-                     (list :origin (list :buffer buffer)))))
+                    (madrigal-context buffer)))
          (request (madrigal-dwim-suggestion-request-create
                    :id "stale-dwim" :action-context context
                    :context "(:origin (:buffer (:name \"old\")))"
@@ -2141,56 +1966,16 @@
                (lambda (&rest args) (nth 6 args))))
       (should (eq request (madrigal-do--read-dwim-history-request))))))
 
-(ert-deftest madrigal-do-dwim-history-renders-request-response-and-timing ()
-  (with-temp-buffer
-    (insert "Focused suggestion context")
-    (let ((default-directory temporary-file-directory)
-          buffer)
-      (cl-letf (((symbol-function 'project-current) (lambda (&rest _) nil))
-                ((symbol-function 'display-buffer)
-                 (lambda (value &rest _) (setq buffer value))))
-        (let* ((context (madrigal-focus-context (current-buffer)))
-               (request
-                (madrigal-dwim-suggestion-request-create
-                 :id "dwim-1" :action-context context
-                 :context (madrigal-do--suggestion-context context)
-                 :prompt (madrigal-do--suggestion-prompt context)
-                 :response "{\"suggestions\":[]}" :status 'success
-                 :started-at (current-time))))
-          (unwind-protect
-              (progn
-                (madrigal-do-dwim-history request)
-                (with-current-buffer buffer
-                  (should (derived-mode-p 'org-mode))
-                  (should buffer-read-only)
-                  (should (eq (key-binding (kbd "q")) #'quit-window))
-                  (should (string-match-p
-                           (regexp-quote
-                            "* Request\n** Context\n#+begin_src emacs-lisp\n'(")
-                           (buffer-string)))
-                  (should (string-match-p "Focused suggestion context"
-                                          (buffer-string)))
-                  (should (string-match-p (regexp-quote "* Response")
-                                          (buffer-string)))
-                  (goto-char (point-min))
-                  (search-forward "#+begin_src emacs-lisp\n")
-                  (let ((start (point)))
-                    (search-forward "\n#+end_src")
-                    (let ((form (read (buffer-substring-no-properties
-                                       start (match-beginning 0)))))
-                      (should (eq 'quote (car form)))
-                      (should (plist-get (cadr form) :instructions)))))
-            (when (buffer-live-p buffer)
-              (kill-buffer buffer)))))))))
+
 
 (ert-deftest madrigal-do-introspection-exposes-current-action-history ()
   (skip-unless (madrigal-llm-available-p))
   (with-temp-buffer
-    (insert "focused")
+    (insert "context")
     (let* ((default-directory temporary-file-directory)
            (context
             (cl-letf (((symbol-function 'project-current) (lambda (&rest _) nil)))
-              (madrigal-focus-context (current-buffer))))
+              (madrigal-context (current-buffer))))
            (action
             (madrigal-action-create
              :id "action-1" :instruction "Inspect"
@@ -2261,40 +2046,14 @@
      (madrigal-do--parse-suggestions
       (format "{\"suggestions\":[%s]}" entries)))))
 
-(ert-deftest madrigal-do-suggestion-context-is-local-to-point ()
-  (with-temp-buffer
-    (insert "REMOTE-TEXT" (make-string 13000 ?a) "LOCAL-TEXT"
-            (make-string 13000 ?z))
-    (search-backward "LOCAL-TEXT")
-    (let ((default-directory temporary-file-directory))
-      (cl-letf (((symbol-function 'project-current) (lambda (&rest _) nil)))
-        (let ((context (madrigal-do--suggestion-context
-                        (madrigal-focus-context (current-buffer)))))
-          (should (string-match-p "LOCAL-TEXT" context))
-          (should (string-match-p ":range" context))
-          (should-not (string-match-p "REMOTE-TEXT" context)))))))
 
-(ert-deftest madrigal-do-suggestion-context-preserves-source-at-point ()
-  (with-temp-buffer
-    (insert "(message \"unbroken string\")")
-    (search-backward "string")
-    (forward-char 3)
-    (let ((default-directory temporary-file-directory))
-      (cl-letf (((symbol-function 'project-current) (lambda (&rest _) nil)))
-        (let ((context (madrigal-do--suggestion-context
-                        (madrigal-focus-context (current-buffer)))))
-          (should (string-match-p (regexp-quote "\\\"unbroken string\\\"") context))
-          (should-not (string-match-p "<<POINT>>" context)))))))
+
+
 
 (ert-deftest madrigal-do-dwim-removes-indicator-when-suggestion-read-quits ()
   (with-temp-buffer
-    (insert "focused")
-    (let* ((context
-            (madrigal-focus-normalize-context
-             (list :origin
-                   (list :buffer (current-buffer)
-                         :buffer-context (list :point 1 :text "focused"
-                                               :range '(1 . 8))))))
+    (insert "context")
+    (let* ((context (madrigal-context (current-buffer)))
            (madrigal-do--active-dwim-suggestions nil)
            (madrigal-do--recent-dwim-suggestions nil)
            success request indicator)
@@ -2323,8 +2082,7 @@
 
 (ert-deftest madrigal-do-dwim-completion-accepts-a-custom-action ()
   (with-temp-buffer
-    (let* ((context (madrigal-focus-normalize-context
-                     (list :origin (list :buffer (current-buffer)))))
+    (let* ((context (madrigal-context (current-buffer)))
            (suggestions
             (list (madrigal-action-suggestion-create
                    :relevance 0.9 :prompt "Use the suggestion.")))
@@ -2337,32 +2095,7 @@
                        (madrigal-do--read-suggestion context suggestions)))
         (should-not require-match)))))
 
-(ert-deftest madrigal-do-formats-suggestions-for-completion ()
-  (let ((suggestion
-         (madrigal-action-suggestion-create
-          :relevance 0.9
-          :action '(:description "Run the test."
-                    :tool-call (:name "eval" :arguments (:source "(test)"))))))
-    (let ((display (madrigal-do--suggestion-display suggestion)))
-      (should (equal "● ⚡ Run the test." display))
-      (should (get-text-property 0 'face display))
-      (should-not (get-text-property 2 'face display)))
-    (let* ((formatted (madrigal-do--org-fontify-string "Run =make test= now"))
-           (code-position (string-match "make" formatted)))
-      (should (eq t (get-text-property (1- code-position) 'invisible formatted)))
-      (should (eq 'org-verbatim
-                  (car (get-text-property code-position 'face formatted)))))
-    (should (equal '("●" "◕" "◑" "◔" "○")
-                   (mapcar #'madrigal-do--relevance-indicator
-                           '(1.0 0.7 0.5 0.2 0.0))))
-    (let ((metadata (funcall (madrigal-do--suggestion-completion-table nil)
-                             "" nil 'metadata))
-          (prompt (madrigal-action-suggestion-create
-                   :relevance 0.5 :prompt "Explain this.")))
-      (should (eq 'madrigal-dwim-suggestion
-                  (alist-get 'category (cdr metadata))))
-      (should (equal "◑ 🧠 Explain this."
-                     (madrigal-do--suggestion-display prompt))))))
+
 
 (ert-deftest madrigal-do-discards-malformed-invocations-and-duplicate-labels ()
   (let ((suggestions
@@ -2373,8 +2106,7 @@
 
 (ert-deftest madrigal-do-immediate-selection-invokes-eval-once-without-controller ()
   (with-temp-buffer
-    (let* ((context (madrigal-focus-normalize-context
-                     (list :origin (list :buffer (current-buffer)))))
+    (let* ((context (madrigal-context (current-buffer)))
            (suggestion
             (madrigal-action-suggestion-create
              :relevance 1
@@ -2525,7 +2257,7 @@
   (with-temp-buffer
     (let ((default-directory temporary-file-directory))
       (cl-letf (((symbol-function 'project-current) (lambda (&rest _) nil)))
-        (let* ((context (madrigal-focus-context (current-buffer)))
+        (let* ((context (madrigal-context (current-buffer)))
                (prompt (madrigal-do--suggestion-prompt context)))
           (should (eq madrigal-do--suggestion-response-schema
                       (llm-chat-prompt-response-format prompt)))
@@ -2583,5 +2315,466 @@
         (insert "!")
         (madrigal-context-size)
         (should (= 2 calls))))))
+
+(ert-deftest madrigal-context-source-freezes-document-text ()
+  (with-temp-buffer
+    (insert "alpha beta")
+    (goto-char 3)
+    (let ((source (madrigal-context-capture)))
+      (erase-buffer)
+      (should (equal "alpha beta" (madrigal-context-source-text source))))))
+
+(ert-deftest madrigal-context-active-region-always-wins-default-selection ()
+  (with-temp-buffer
+    (insert "alpha beta gamma")
+    (goto-char 11)
+    (push-mark 7 t t)
+    (activate-mark)
+    (let* ((source (madrigal-context-capture))
+           (candidates (madrigal-context-discover source))
+           (selected (madrigal-context-select-default source candidates)))
+      (should (equal "region" (madrigal-context-candidate-label selected)))
+      (should (equal '(:active-region t :exact t)
+                     (madrigal-context-candidate-signals selected)))
+      (should (equal "beta"
+                     (plist-get
+                      (madrigal-context-document-metadata
+                       (madrigal-context-materialize
+                        (madrigal-context-selection-create
+                         :source source :candidate selected)))
+                      :text))))))
+
+(ert-deftest madrigal-context-discovery-preserves-same-range-labels ()
+  (with-temp-buffer
+    (insert "alpha")
+    (goto-char 3)
+    (let* ((source (madrigal-context-capture))
+           (candidates (madrigal-context-discover source))
+           (same-range
+            (seq-filter
+             (lambda (candidate)
+               (and (eq (madrigal-context-candidate-target candidate) 'document)
+                    (= 1 (madrigal-context-candidate-start candidate))
+                    (= 6 (madrigal-context-candidate-end candidate))))
+             candidates)))
+      (should (> (length same-range) 1))
+      (should (> (length (delete-dups
+                          (mapcar #'madrigal-context-candidate-label same-range)))
+                 1)))))
+
+(ert-deftest madrigal-context-provider-relevance-must-be-bounded ()
+  (with-temp-buffer
+    (insert "alpha")
+    (let ((source (madrigal-context-capture)))
+      (should-error
+       (madrigal-context--validate-relevance
+        (madrigal-context-document-candidate
+         source 'test 'invalid "invalid" 1 6 2.0)))
+      (should (= 1.0
+                 (madrigal-context-candidate-score
+                  (madrigal-context--validate-relevance
+                   (madrigal-context-document-candidate
+                    source 'test 'maximum "maximum" 1 6 1.0))))))))
+
+(ert-deftest madrigal-context-default-order-is-stable ()
+  (with-temp-buffer
+    (insert "alpha beta")
+    (goto-char 3)
+    (let* ((source (madrigal-context-capture))
+           (first-candidates (madrigal-context-discover source))
+           (first (mapcar #'madrigal-context-candidate-id first-candidates))
+           (second (mapcar #'madrigal-context-candidate-id
+                           (madrigal-context-discover source))))
+      (should (equal first second))
+      (dolist (candidate first-candidates)
+        (should (<= 0.0 (madrigal-context-candidate-score candidate) 1.0)))
+      (should (string-match-p
+               "\\`[●◕◑◔○] [^ ]+ +[^ ]+ +\\["
+               (madrigal-context--candidate-display
+                (car first-candidates)))))))
+
+(ert-deftest madrigal-context-provider-priority-multiplies-scope-priority ()
+  (with-temp-buffer
+    (insert "alpha")
+    (let* ((madrigal-context-providers
+            (list
+             (madrigal-context-provider-create
+              :name 'generic :priority 0.5 :applicable (lambda (_) t)
+              :discover
+              (lambda (source)
+                (list (madrigal-context-document-candidate
+                       source 'generic 'whole "generic scope" 1 6 1.0))))
+             (madrigal-context-provider-create
+              :name 'specific :priority 1.0 :applicable (lambda (_) t)
+              :discover
+              (lambda (source)
+                (list (madrigal-context-document-candidate
+                       source 'specific 'whole "specific scope" 1 6 0.6))))))
+           (candidates (madrigal-context-discover (madrigal-context-capture))))
+      (should (equal 'specific
+                     (madrigal-context--candidate-provider (car candidates))))
+      (should (= 0.6 (madrigal-context-candidate-score (car candidates))))
+      (should (= 0.5 (madrigal-context-candidate-score (cadr candidates)))))))
+
+(ert-deftest madrigal-context-provider-limit-is-the-only-truncation ()
+  (with-temp-buffer
+    (insert "abcdefghij")
+    (let* ((source (madrigal-context-capture))
+           (candidate (madrigal-context-document-candidate
+                       source 'test 'all "all" 1 11 0.5 :confidence 1.0))
+           (selection (madrigal-context-selection-create
+                       :source source :candidate candidate))
+           (complete (madrigal-context-materialize selection))
+           (limited (madrigal-context-materialize selection 4)))
+      (should (equal "abcdefghij"
+                     (plist-get (madrigal-context-document-metadata complete)
+                                :text)))
+      (should (equal "abcd"
+                     (plist-get (madrigal-context-document-metadata limited)
+                                :text)))
+      (should (eq 'truncated
+                  (plist-get (plist-get limited :scope)
+                             :provider-context-limit-status))))))
+
+(ert-deftest madrigal-context-session-target-is-private ()
+  (with-temp-buffer
+    (insert "private document")
+    (let* ((source (madrigal-context-capture))
+           (candidate (seq-find
+                       (lambda (item)
+                         (eq 'session
+                             (madrigal-context-candidate-target item)))
+                       (madrigal-context-discover source)))
+           (context (madrigal-context-materialize
+                     (madrigal-context-selection-create
+                      :source source :candidate candidate)))
+           (model-context (madrigal-context-model-data context)))
+      (should (plist-get model-context :session))
+      (should-not (plist-member model-context :origin))
+      (should-not (plist-member model-context :project))
+      (should-not (string-match-p "private document"
+                                  (prin1-to-string model-context))))))
+
+(ert-deftest madrigal-context-project-target-has-metadata-only ()
+  (with-temp-buffer
+    (insert "private document")
+    (let* ((root (file-name-as-directory temporary-file-directory))
+           (project 'fake-project))
+      (cl-letf (((symbol-function 'project-current) (lambda (&rest _) project))
+                ((symbol-function 'project-root) (lambda (_) root))
+                ((symbol-function 'project-name) (lambda (_) "fake")))
+        (let* ((source (madrigal-context-capture))
+               (candidate (seq-find
+                           (lambda (item)
+                             (eq 'project
+                                 (madrigal-context-candidate-target item)))
+                           (madrigal-context-discover source)))
+               (context (madrigal-context-materialize
+                         (madrigal-context-selection-create
+                          :source source :candidate candidate))))
+          (should (equal "fake" (plist-get (plist-get context :project) :name)))
+          (should-not (plist-member context :origin))
+          (should-not (string-match-p "private document"
+                                      (madrigal-context-render context))))))))
+
+(ert-deftest madrigal-context-selects-project-scope-without-prompting ()
+  (with-temp-buffer
+    (let* ((root (file-name-as-directory temporary-file-directory))
+           (project 'fake-project))
+      (cl-letf (((symbol-function 'project-current) (lambda (&rest _) project))
+                ((symbol-function 'project-root) (lambda (_) root))
+                ((symbol-function 'project-name) (lambda (_) "fake"))
+                ((symbol-function 'madrigal-context-read-candidate)
+                 (lambda (&rest _)
+                   (ert-fail "Scope completion should not be opened"))))
+        (let ((context (madrigal-context-choose nil nil nil nil nil 'project)))
+          (should (eq 'project (plist-get (plist-get context :scope) :target)))
+          (should (equal "fake" (plist-get (plist-get context :project) :name)))
+          (should-not (plist-member context :origin)))))))
+
+(ert-deftest madrigal-context-project-and-session-have-zero-relevance ()
+  (with-temp-buffer
+    (let* ((source (madrigal-context-capture))
+           (candidates (madrigal-context-discover source)))
+      (dolist (candidate candidates)
+        (when (memq (madrigal-context-candidate-target candidate)
+                    '(project session))
+          (should (= 0.0 (madrigal-context-candidate-score candidate))))))))
+
+(ert-deftest madrigal-dwim-suggestion-displays-review-metadata ()
+  (let* ((suggestion
+          (madrigal-action-suggestion-create
+           :relevance 0.9 :confidence 0.8 :impact "project"
+           :reversibility "review" :prompt "Inspect it"))
+         (display (madrigal-do--suggestion-display suggestion)))
+    (should (string-match-p "confidence 80%" display))
+    (should (string-match-p "project; review" display))))
+
+(ert-deftest madrigal-context-completion-uses-request-preview-face ()
+  (with-temp-buffer
+    (insert "alpha")
+    (goto-char 3)
+    (let* ((source (madrigal-context-capture))
+           (candidates (madrigal-context-discover source))
+           seen-face seen-completion-properties)
+      (cl-letf (((symbol-function 'completing-read)
+                 (lambda (_prompt entries &rest _)
+                   (setq seen-face
+                         (overlay-get (car (overlays-at (point))) 'face)
+                         seen-completion-properties completion-extra-properties)
+                   (caar entries))))
+        (madrigal-context-read-candidate source candidates 'madrigal-test-face))
+      (should (eq 'madrigal-test-face seen-face))
+      (should (eq 'identity
+                  (plist-get seen-completion-properties :display-sort-function)))
+      (should-not (overlays-at (point))))))
+
+(defun madrigal-test--context-candidate-by-provider (provider candidates)
+  "Return PROVIDER's first member of CANDIDATES."
+  (seq-find (lambda (candidate)
+              (eq provider (madrigal-context--candidate-provider candidate)))
+            candidates))
+
+(ert-deftest madrigal-context-outline-provider-walks-org-ancestors ()
+  (with-temp-buffer
+    (org-mode)
+    (insert "* Parent\n** Child\nBody\n")
+    (goto-char (point-max))
+    (let* ((source (madrigal-context-capture))
+           (candidates (madrigal-context--outline-discover source)))
+      (should (= 2 (length candidates)))
+      (should (seq-every-p
+               (lambda (candidate)
+                 (equal "Org subtree"
+                        (madrigal-context-candidate-label candidate)))
+               candidates)))))
+
+(ert-deftest madrigal-context-diff-provider-selects-hunk-and-file ()
+  (require 'diff-mode)
+  (with-temp-buffer
+    (insert "--- a/demo\n+++ b/demo\n@@ -1 +1 @@\n-old\n+new\n")
+    (diff-mode)
+    (goto-char (point-min))
+    (search-forward "+new")
+    (let* ((source (madrigal-context-capture))
+           (candidates (madrigal-context--diff-discover source)))
+      (should (seq-find (lambda (candidate)
+                          (equal "diff hunk"
+                                 (madrigal-context-candidate-label candidate)))
+                        candidates))
+      (should (seq-find (lambda (candidate)
+                          (equal "diff file"
+                                 (madrigal-context-candidate-label candidate)))
+                        candidates)))))
+
+(ert-deftest madrigal-context-compilation-provider-selects-diagnostic ()
+  (require 'compile)
+  (with-temp-buffer
+    (compilation-mode)
+    (let ((inhibit-read-only t))
+      (insert "demo.el:3:2: Something failed\n")
+      (put-text-property (point-min) (point-max)
+                         'compilation-message 'diagnostic))
+    (goto-char (+ (point-min) 5))
+    (let* ((source (madrigal-context-capture))
+           (candidate (car (madrigal-context--compilation-discover source))))
+      (should (equal "compilation diagnostic"
+                     (madrigal-context-candidate-label candidate)))
+      (should (equal (cons (point-min) (point-max))
+                     (cons (madrigal-context-candidate-start candidate)
+                           (madrigal-context-candidate-end candidate)))))))
+
+(ert-deftest madrigal-context-dired-provider-selects-entry ()
+  (require 'dired)
+  (let* ((directory (make-temp-file "madrigal-dired-" t))
+         (file (expand-file-name "entry.txt" directory))
+         buffer)
+    (unwind-protect
+        (progn
+          (write-region "hello" nil file nil 'silent)
+          (setq buffer (dired-noselect directory))
+          (with-current-buffer buffer
+            (goto-char (point-min))
+            (search-forward "entry.txt")
+            (let* ((source (madrigal-context-capture))
+                   (candidate (car (madrigal-context--dired-discover source))))
+              (should (equal "Dired entry"
+                             (madrigal-context-candidate-label candidate)))
+              (should (string-match-p
+                       "entry.txt"
+                       (madrigal-context--source-text
+                        source
+                        (madrigal-context-candidate-start candidate)
+                        (madrigal-context-candidate-end candidate)))))))
+      (when (buffer-live-p buffer) (kill-buffer buffer))
+      (delete-directory directory t))))
+
+(ert-deftest madrigal-context-tabulated-list-provider-selects-entry ()
+  (require 'tabulated-list)
+  (with-temp-buffer
+    (tabulated-list-mode)
+    (setq tabulated-list-format [("Name" 20 t)]
+          tabulated-list-entries '((demo ["Demo row"])))
+    (tabulated-list-init-header)
+    (tabulated-list-print)
+    (goto-char (point-min))
+    (search-forward "Demo row")
+    (let* ((source (madrigal-context-capture))
+           (candidate (car (madrigal-context--tabulated-list-discover source))))
+      (should (equal "tabulated-list entry"
+                     (madrigal-context-candidate-label candidate))))))
+
+(ert-deftest madrigal-context-message-provider-distinguishes-header-and-body ()
+  (require 'message)
+  (with-temp-buffer
+    (insert "To: person@example.test\nSubject: Demo\n"
+            mail-header-separator "\nBody text\n")
+    (message-mode)
+    (goto-char (point-min))
+    (let* ((source (madrigal-context-capture))
+           (candidate (seq-find
+                       (lambda (item)
+                         (equal "message header"
+                                (madrigal-context-candidate-label item)))
+                       (madrigal-context--message-discover source))))
+      (should candidate))
+    (goto-char (point-max))
+    (let* ((source (madrigal-context-capture))
+           (candidate (seq-find
+                       (lambda (item)
+                         (equal "message body"
+                                (madrigal-context-candidate-label item)))
+                       (madrigal-context--message-discover source))))
+      (should candidate)
+      (should (string-match-p
+               "Body text"
+               (madrigal-context--source-text
+                source (madrigal-context-candidate-start candidate)
+                (madrigal-context-candidate-end candidate)))))))
+
+(ert-deftest madrigal-context-comint-provider-selects-interaction ()
+  (require 'comint)
+  (with-temp-buffer
+    (comint-mode)
+    (setq-local comint-prompt-regexp "^\\$ ")
+    (let ((inhibit-read-only t))
+      (insert "$ first\nfirst output\n$ second\nsecond output\n"))
+    (goto-char (point-min))
+    (search-forward "first output")
+    (let* ((source (madrigal-context-capture))
+           (candidate (car (madrigal-context--comint-discover source)))
+           (text (madrigal-context--source-text
+                  source (madrigal-context-candidate-start candidate)
+                  (madrigal-context-candidate-end candidate))))
+      (should (string-match-p "\\`\\$ first" text))
+      (should-not (string-match-p "second output" text)))))
+
+(ert-deftest madrigal-context-notmuch-show-selects-mail-and-thread ()
+  (with-temp-buffer
+    (insert "Mail one\n\nMail two\n")
+    (setq major-mode 'notmuch-show-mode)
+    (goto-char 3)
+    (cl-letf (((symbol-function 'notmuch-show-message-extent)
+               (lambda () (cons (point-min) 10)))
+              ((symbol-function 'notmuch-show-get-message-properties)
+               (lambda () '(:headers (:Subject "A useful subject")))))
+      (let* ((source (madrigal-context-capture))
+             (candidates (madrigal-context--notmuch-discover source))
+             (mail (seq-find
+                    (lambda (candidate)
+                      (string-prefix-p
+                       "Notmuch mail"
+                       (madrigal-context-candidate-label candidate)))
+                    candidates))
+             (thread (seq-find
+                      (lambda (candidate)
+                        (string-prefix-p
+                         "Notmuch thread"
+                         (madrigal-context-candidate-label candidate)))
+                      candidates)))
+        (should mail)
+        (should thread)
+        (should (< (madrigal-context-candidate-size mail)
+                   (madrigal-context-candidate-size thread)))))))
+
+(ert-deftest madrigal-context-notmuch-search-selects-thread-result ()
+  (with-temp-buffer
+    (insert "Thread result\n")
+    (setq major-mode 'notmuch-search-mode)
+    (goto-char 3)
+    (cl-letf (((symbol-function 'notmuch-search-get-result)
+               (lambda (&optional _) '(:thread "id" :subject "Subject")))
+              ((symbol-function 'notmuch-search-result-beginning)
+               (lambda (&optional _) (point-min)))
+              ((symbol-function 'notmuch-search-result-end)
+               (lambda (&optional _) (point-max))))
+      (let* ((source (madrigal-context-capture))
+             (candidate (car (madrigal-context--notmuch-discover source))))
+        (should (equal "Notmuch thread: Subject"
+                       (madrigal-context-candidate-label candidate)))))))
+
+(ert-deftest madrigal-context-ement-room-list-selects-room ()
+  (with-temp-buffer
+    (insert "Matrix room\n")
+    (setq major-mode 'ement-tabulated-room-list-mode)
+    (goto-char 3)
+    (cl-letf (((symbol-function 'tabulated-list-get-id)
+               (lambda (&optional _) (vector 'room 'session)))
+              ((symbol-function 'ement-room-display-name)
+               (lambda (_) "Madrigal")))
+      (let* ((source (madrigal-context-capture))
+             (candidate
+              (car (madrigal-context--ement-room-list-discover source))))
+        (should (equal "Ement room: Madrigal"
+                       (madrigal-context-candidate-label candidate)))))))
+
+(ert-deftest madrigal-context-ement-room-selects-event-and-timeline ()
+  (require 'ewoc)
+  (with-temp-buffer
+    (let ((ewoc (ewoc-create (lambda (event) (insert (plist-get event :body) "\n")))))
+      (ewoc-enter-last ewoc '(:body "First event"))
+      (ewoc-enter-last ewoc '(:body "Second event"))
+      (setq major-mode 'ement-room-mode)
+      (set (make-local-variable 'ement-ewoc) ewoc)
+      (goto-char (point-min))
+      (search-forward "First")
+      (cl-letf (((symbol-function 'ement-event-p) (lambda (_) t))
+                ((symbol-function 'ement-event-content)
+                 (lambda (event) `((body . ,(plist-get event :body))))))
+        (let* ((source (madrigal-context-capture))
+               (candidates (madrigal-context--ement-room-discover source))
+               (event
+                (seq-find
+                 (lambda (candidate)
+                   (string-prefix-p
+                    "Ement event"
+                    (madrigal-context-candidate-label candidate)))
+                 candidates)))
+          (should (equal "Ement event: First event"
+                         (madrigal-context-candidate-label event)))
+          (should (seq-find
+                   (lambda (candidate)
+                     (string-prefix-p
+                      "Ement room timeline"
+                      (madrigal-context-candidate-label candidate)))
+                   candidates)))))))
+
+(ert-deftest madrigal-dwim-schema-requires-nullable-scope-metadata ()
+  (let* ((suggestions
+          (plist-get (plist-get madrigal-do--suggestion-response-schema
+                                :properties)
+                     :suggestions))
+         (alternatives (append (plist-get (plist-get suggestions :items)
+                                          :anyOf)
+                               nil)))
+    (dolist (alternative alternatives)
+      (should (seq-contains-p (plist-get alternative :required)
+                              "required_scope" #'equal))
+      (should (equal [(:type "string") (:type "null")]
+                     (plist-get
+                      (plist-get
+                       (plist-get alternative :properties)
+                       :required_scope)
+                      :anyOf))))))
 
 ;;; madrigal-test.el ends here

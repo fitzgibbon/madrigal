@@ -1,4 +1,4 @@
-;;; madrigal-do.el --- Stateless focused actions for Madrigal  -*- lexical-binding: t; -*-
+;;; madrigal-do.el --- Stateless context actions for Madrigal  -*- lexical-binding: t; -*-
 
 ;;; Code:
 
@@ -6,7 +6,7 @@
 (require 'color)
 (require 'madrigal-agent-controller)
 (require 'json)
-(require 'madrigal-focus)
+(require 'madrigal-context)
 (require 'org)
 (require 'pp)
 (require 'seq)
@@ -15,7 +15,7 @@
 (require 'llm nil t)
 
 (defcustom madrigal-do-agent "do"
-  "Madrigal agent used to execute focused actions."
+  "Madrigal agent used to execute context actions."
   :type 'string
   :group 'madrigal)
 
@@ -34,15 +34,6 @@
 
 A value of zero disables truncation."
   :type 'natnum
-  :group 'madrigal)
-
-(defcustom madrigal-do-dwim-context-limit 4096
-  "Maximum buffer characters sent by `madrigal-do-dwim'.
-
-Mode-specific selectors choose the relevant source range.  If that range is
-larger than this value, it is reduced around point.  When nil, include the
-complete selected range."
-  :type '(choice (const :tag "Complete selected range" nil) posinteger)
   :group 'madrigal)
 
 (defcustom madrigal-do-request-faces
@@ -100,6 +91,10 @@ that accent over the default background at separate context and point strengths.
 (cl-defstruct (madrigal-action-suggestion
                (:constructor madrigal-action-suggestion-create))
   relevance
+  confidence
+  impact
+  reversibility
+  required-scope
   action
   prompt)
 
@@ -135,6 +130,7 @@ that accent over the default background at separate context and point strengths.
   finished-at
   handle
   indicator
+  ui-face
   diagnostics)
 
 (defvar madrigal-do--active-actions nil
@@ -167,16 +163,23 @@ that accent over the default background at separate context and point strengths.
 (defvar madrigal-do--spinner-index 0
   "Current frame index for Madrigal request spinners.")
 
+(defvar madrigal-do--minibuffer-face nil
+  "Face used for the mode-line indicator while Madrigal reads input.")
+
 (defconst madrigal-do--spinner-frames ["⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏"])
 
-(defvar madrigal-do--mode-line-construct
-  '(:eval (madrigal-do--mode-line-string)))
+(defvar madrigal-do--mode-line-construct nil
+  "Cached context-action status displayed in the mode line.")
 
-(put 'madrigal-do--mode-line-construct 'risky-local-variable t)
+(defconst madrigal-do--mode-line-entry
+  '(:eval madrigal-do--mode-line-construct))
 
-(unless (memq 'madrigal-do--mode-line-construct global-mode-string)
-  (setq global-mode-string
-        (append global-mode-string '(madrigal-do--mode-line-construct))))
+(setq madrigal-do--mode-line-construct ""
+      global-mode-string
+      (delq 'madrigal-do--mode-line-construct global-mode-string))
+(unless global-mode-string
+  (setq global-mode-string '("")))
+(add-to-list 'global-mode-string madrigal-do--mode-line-entry t)
 
 (defconst madrigal-do--suggestion-max-count 8)
 (defconst madrigal-do--suggestion-description-limit 80)
@@ -257,25 +260,85 @@ that accent over the default background at separate context and point strengths.
         (list :foreground colour :weight 'bold)
       (cdr faces))))
 
+(defun madrigal-do--point-mode-line-face (face)
+  "Return a bright mode-line face from point-marker FACE."
+  (let* ((box (and (listp face) (plist-get face :box)))
+         (colour (and (listp box) (plist-get box :color))))
+    (if colour (list :foreground colour :weight 'bold)
+      face)))
+
 (defun madrigal-do--indicator-mode-line-face (indicator)
-  "Return a mode-line face matching request INDICATOR."
-  (let* ((face (and (overlayp (car-safe indicator))
-                    (overlay-get (car indicator) 'face)))
-         (colour (and (listp face) (plist-get face :background))))
-    (if colour (list :foreground colour :weight 'bold) face)))
+  "Return a bright mode-line face matching INDICATOR's point marker."
+  (let* ((point-overlay (cadr indicator))
+         (before-string (and (overlayp point-overlay)
+                             (overlay-get point-overlay 'before-string)))
+         (face (and before-string (get-text-property 0 'face before-string))))
+    (or (madrigal-do--point-mode-line-face face)
+        (madrigal-do--mode-line-face (madrigal-do--next-request-accent)))))
+
+(defun madrigal-do--mode-line-clickable
+    (text face help context cancel-function)
+  "Return clickable mode-line TEXT for CONTEXT using FACE and HELP.
+
+Mouse-1 visits CONTEXT.  Mouse-3 calls CANCEL-FUNCTION."
+  (let ((map (make-sparse-keymap)))
+    (define-key map [mode-line mouse-1]
+                (lambda (_event)
+                  (interactive "e")
+                  (madrigal-do--visit-context context)))
+    (define-key map [mode-line mouse-3]
+                (lambda (_event)
+                  (interactive "e")
+                  (funcall cancel-function)))
+    (propertize text
+                'face face
+                'mouse-face 'mode-line-highlight
+                'local-map map
+                'help-echo (format "%s; mouse-1: visit context; mouse-3: cancel"
+                                   help))))
+
+(defun madrigal-do--cancel-action (action)
+  "Cancel active ACTION."
+  (when (memq action madrigal-do--active-actions)
+    (madrigal-agent-controller-cancel (madrigal-action-handle action))))
+
+(defun madrigal-do--cancel-dwim-suggestion (request)
+  "Cancel active DWIM suggestion REQUEST."
+  (when (memq request madrigal-do--active-dwim-suggestions)
+    (llm-cancel-request (madrigal-dwim-suggestion-request-handle request))
+    (madrigal-do--finish-dwim-suggestion request 'cancelled)
+    (message "Cancelled Madrigal action suggestions")))
 
 (defun madrigal-do--mode-line-string ()
-  "Return coloured status indicators for focused Madrigal requests."
+  "Return coloured status indicators for Madrigal requests."
   (let* ((frame (aref madrigal-do--spinner-frames
                       (mod madrigal-do--spinner-index
                            (length madrigal-do--spinner-frames))))
          (active
           (mapcar
            (lambda (action)
-             (propertize frame
-                         'face (madrigal-action-ui-face action)
-                         'help-echo (madrigal-action-instruction action)))
+             (madrigal-do--mode-line-clickable
+              frame
+              (madrigal-action-ui-face action)
+              (madrigal-action-instruction action)
+              (madrigal-action-context action)
+              (lambda () (madrigal-do--cancel-action action))))
            (reverse madrigal-do--active-actions)))
+         (suggestions
+          (unless madrigal-do--minibuffer-face
+            (mapcar
+             (lambda (request)
+               (madrigal-do--mode-line-clickable
+                frame
+                (madrigal-dwim-suggestion-request-ui-face request)
+                "Madrigal is finding likely actions"
+                (madrigal-dwim-suggestion-request-action-context request)
+                (lambda () (madrigal-do--cancel-dwim-suggestion request))))
+             (reverse madrigal-do--active-dwim-suggestions))))
+         (scope-picker
+          (and madrigal-do--minibuffer-face
+               (list (propertize "?" 'face madrigal-do--minibuffer-face
+                                'help-echo "Madrigal input pending"))))
          (completed
           (mapcar
            (lambda (entry)
@@ -284,21 +347,38 @@ that accent over the default background at separate context and point strengths.
                            'face (madrigal-action-ui-face action)
                            'help-echo (madrigal-action-instruction action))))
            (reverse madrigal-do--mode-line-feedback)))
-         (indicators (append active completed)))
+         (indicators (append active suggestions scope-picker completed)))
     (when indicators
       (concat " 🧠 " (string-join indicators " ")))))
 
+(defun madrigal-do--refresh-mode-line ()
+  "Refresh the cached context-action mode-line status."
+  (setq madrigal-do--mode-line-construct
+        (or (madrigal-do--mode-line-string) "")))
+
+(defun madrigal-do--call-with-minibuffer-indicator (face function)
+  "Call FUNCTION with a bright question-mark indicator using FACE."
+  (let ((madrigal-do--minibuffer-face face))
+    (madrigal-do--refresh-mode-line)
+    (force-mode-line-update t)
+    (unwind-protect
+        (funcall function)
+      (setq madrigal-do--minibuffer-face nil)
+      (madrigal-do--refresh-mode-line)
+      (force-mode-line-update t))))
+
 (defun madrigal-do--spinner-tick ()
-  "Advance the focused-action mode-line spinner."
+  "Advance the context-action mode-line spinner."
   (setq madrigal-do--spinner-index (1+ madrigal-do--spinner-index))
+  (madrigal-do--refresh-mode-line)
   (force-mode-line-update t)
-  (unless madrigal-do--active-actions
+  (unless (or madrigal-do--active-actions madrigal-do--active-dwim-suggestions)
     (when (timerp madrigal-do--spinner-timer)
       (cancel-timer madrigal-do--spinner-timer))
     (setq madrigal-do--spinner-timer nil)))
 
 (defun madrigal-do--ensure-spinner-timer ()
-  "Start the focused-action spinner timer when needed."
+  "Start the context-action spinner timer when needed."
   (unless (timerp madrigal-do--spinner-timer)
     (setq madrigal-do--spinner-timer
           (run-at-time 0 0.12 #'madrigal-do--spinner-tick))))
@@ -307,20 +387,22 @@ that accent over the default background at separate context and point strengths.
   "Show GLYPH for completed ACTION for two seconds."
   (let ((entry (cons action glyph)))
     (push entry madrigal-do--mode-line-feedback)
+    (madrigal-do--refresh-mode-line)
     (force-mode-line-update t)
     (run-at-time
      2 nil
      (lambda ()
        (setq madrigal-do--mode-line-feedback
              (delq entry madrigal-do--mode-line-feedback))
+       (madrigal-do--refresh-mode-line)
        (force-mode-line-update t)))))
 
 (defun madrigal-do--make-request-indicator (context &optional face)
   "Highlight CONTEXT using colours derived from FACE or an accent pair."
-  (let* ((context (madrigal-focus-normalize-context context))
-         (buffer (madrigal-focus-context-origin-buffer context))
+  (let* ((context (madrigal-context-normalize context))
+         (buffer (madrigal-context-origin-buffer context))
          (buffer-context (plist-get (plist-get context :origin) :buffer-context))
-         (marker (madrigal-focus-context-point context))
+         (marker (madrigal-context-point context))
          (range (plist-get buffer-context :range)))
     (when (and (buffer-live-p buffer) (markerp marker) (marker-buffer marker))
       (with-current-buffer buffer
@@ -357,10 +439,10 @@ that accent over the default background at separate context and point strengths.
 
 (defun madrigal-do--visit-context (context)
   "Visit CONTEXT's live origin and optional point."
-  (let* ((context (madrigal-focus-normalize-context context))
-         (buffer (madrigal-focus-context-origin-buffer context))
-         (marker (madrigal-focus-context-point context))
-         (window (madrigal-focus-context-window context)))
+  (let* ((context (madrigal-context-normalize context))
+         (buffer (madrigal-context-origin-buffer context))
+         (marker (madrigal-context-point context))
+         (window (madrigal-context-window context)))
     (when buffer
       (unless (buffer-live-p buffer)
         (user-error "The captured Madrigal origin is no longer available"))
@@ -389,7 +471,7 @@ that accent over the default background at separate context and point strengths.
           :required ["name" "content"] :additionalProperties :false))
         :required ["document"] :additionalProperties :false)]))
     :required ["result"] :additionalProperties :false)
-  "Structured final response for a focused Madrigal action.")
+  "Structured final response for a Madrigal action.")
 
 (defconst madrigal-do--suggestion-response-schema
   `(:type "object"
@@ -401,6 +483,10 @@ that accent over the default background at separate context and point strengths.
        [(:type "object"
          :properties
          (:relevance (:type "number" :minimum 0 :maximum 1)
+          :confidence (:type "number" :minimum 0 :maximum 1)
+          :impact (:type "string" :enum ["local" "buffer" "project" "session"])
+          :reversibility (:type "string" :enum ["reversible" "review" "destructive"])
+          :required_scope (:anyOf [(:type "string") (:type "null")])
           :action
           (:type "object"
            :properties
@@ -417,12 +503,16 @@ that accent over the default background at separate context and point strengths.
                :required ["source"] :additionalProperties :false))
              :required ["name" "arguments"] :additionalProperties :false))
            :required ["description" "tool_call"] :additionalProperties :false))
-         :required ["relevance" "action"] :additionalProperties :false)
+         :required ["relevance" "confidence" "impact" "reversibility" "required_scope" "action"] :additionalProperties :false)
         (:type "object"
          :properties
          (:relevance (:type "number" :minimum 0 :maximum 1)
+          :confidence (:type "number" :minimum 0 :maximum 1)
+          :impact (:type "string" :enum ["local" "buffer" "project" "session"])
+          :reversibility (:type "string" :enum ["reversible" "review" "destructive"])
+          :required_scope (:anyOf [(:type "string") (:type "null")])
           :prompt (:type "string" :maxLength ,madrigal-do--suggestion-prompt-limit))
-         :required ["relevance" "prompt"] :additionalProperties :false)])))
+         :required ["relevance" "confidence" "impact" "reversibility" "required_scope" "prompt"] :additionalProperties :false)])))
     :required ["suggestions"] :additionalProperties :false)
   "JSON schema for ranked immediate actions and Madrigal prompts.")
 
@@ -453,7 +543,9 @@ When KEEP-INDICATOR is non-nil, transfer its indicator to a selected action."
           (madrigal-dwim-suggestion-request-response request) response
           (madrigal-dwim-suggestion-request-error request) error
           (madrigal-dwim-suggestion-request-finished-at request) (current-time))
-    (madrigal-do--remember-dwim-suggestion request)))
+    (madrigal-do--remember-dwim-suggestion request)
+    (madrigal-do--refresh-mode-line)
+    (force-mode-line-update t)))
 
 (defun madrigal-do--remember-completed (action)
   "Retain completed ACTION within the configured bound."
@@ -462,6 +554,7 @@ When KEEP-INDICATOR is non-nil, transfer its indicator to a selected action."
   (pcase (madrigal-action-status action)
     ('finished (madrigal-do--add-mode-line-feedback action "✓"))
     ('error (madrigal-do--add-mode-line-feedback action "✗")))
+  (madrigal-do--refresh-mode-line)
   (force-mode-line-update t)
   (if (zerop madrigal-do-history-length)
       (setq madrigal-do--recent-actions nil)
@@ -523,7 +616,7 @@ When KEEP-INDICATOR is non-nil, transfer its indicator to a selected action."
      (t (concat (substring summary 0 (max 0 (- limit 1))) "…")))))
 
 (defun madrigal-do--parse-action-response (text)
-  "Parse structured focused-action response TEXT."
+  "Parse structured context-action response TEXT."
   (let* ((object (json-parse-string
                   (madrigal-do--json-response-text text)
                   :object-type 'plist :array-type 'list
@@ -642,7 +735,7 @@ When KEEP-INDICATOR is non-nil, transfer its indicator to a selected action."
 When INCLUDE-BUFFER-TEXT is nil, omit captured text. ACTION may be an action
 record or id and defaults to the current eval action."
   (let* ((action (madrigal-do--resolve-action action))
-         (context (madrigal-focus-model-context
+         (context (madrigal-context-model-data
                    (madrigal-do--action-context action)))
          (origin (plist-get context :origin))
          (buffer-context (plist-get origin :buffer-context)))
@@ -656,6 +749,12 @@ record or id and defaults to the current eval action."
           :instruction (madrigal-action-instruction action)
           :status (madrigal-action-status action)
           :context context)))
+
+(defun madrigal-do-expand-context (candidate-id &optional action)
+  "Read CANDIDATE-ID from ACTION's frozen context capture."
+  (let ((action (madrigal-do--resolve-action action)))
+    (madrigal-context-expand
+     (madrigal-do--action-context action) candidate-id)))
 
 (defun madrigal-do-turn-history (&optional action)
   "Return user and assistant turns for the current or specified ACTION."
@@ -708,13 +807,16 @@ record or id and defaults to the current eval action."
 INDICATOR, when non-nil, is transferred from a DWIM suggestion request."
   (unless (and (stringp instruction) (not (string-empty-p (string-trim instruction))))
     (user-error "Madrigal action instruction is empty"))
-  (let* ((context (madrigal-focus-normalize-context context))
-         (origin-buffer (madrigal-focus-context-origin-buffer context))
+  (let* ((context (madrigal-context-normalize context))
+         (origin-buffer (madrigal-context-origin-buffer context))
          (project (plist-get context :project))
+         (_ (when (and origin-buffer (not (buffer-live-p origin-buffer)))
+              (user-error "The captured Madrigal origin is no longer available")))
          (buffer (or origin-buffer
-                     (let ((buffer (generate-new-buffer " *madrigal-project-do*")))
-                       (with-current-buffer buffer
-                         (setq default-directory (plist-get project :root)))
+                     (let ((buffer (generate-new-buffer " *madrigal-do*")))
+                       (when project
+                         (with-current-buffer buffer
+                           (setq default-directory (plist-get project :root))))
                        buffer)))
          (owns-buffer (null origin-buffer)))
     (let* ((id (madrigal--next-request-id))
@@ -736,13 +838,13 @@ INDICATOR, when non-nil, is transferred from a DWIM suggestion request."
                     :tool-events nil
                     :started-at (current-time)
                     :indicator request-indicator
-                    :ui-face (if indicator
-                                 (madrigal-do--indicator-mode-line-face indicator)
-                               (madrigal-do--mode-line-face accent))))
+                    :ui-face (madrigal-do--indicator-mode-line-face
+                              request-indicator)))
            (event-sink
             (lambda (event)
               (madrigal-do--record-tool-event action event))))
       (push action madrigal-do--active-actions)
+      (madrigal-do--refresh-mode-line)
       (madrigal-do--ensure-spinner-timer)
       (force-mode-line-update t)
       (condition-case err
@@ -750,12 +852,12 @@ INDICATOR, when non-nil, is transferred from a DWIM suggestion request."
                  (madrigal-agent-controller-submit-async
                   :agent madrigal-do-agent
                   :history (list (list :role 'user :content instruction))
-                  :context (madrigal-focus-render-context context)
+                  :context (madrigal-context-render context)
                   :response-format madrigal-do--action-response-schema
                   :environment (list :buffer buffer
                                      :request-id id
                                      :event-sink event-sink
-                                     :focus-context (and origin-buffer context)
+                                     :action-context (and origin-buffer context)
                                      :request-context action)
                   :on-start
                   (lambda (event)
@@ -828,35 +930,74 @@ INDICATOR, when non-nil, is transferred from a DWIM suggestion request."
          (signal (car err) (cdr err))))
       action)))
 
-(defun madrigal-do--read-focused-instruction ()
-  "Capture focus, display its indicator, and read an instruction."
-  (let* ((context (madrigal-focus-context
-                   nil nil madrigal-do-buffer-context-limit))
-         (indicator (madrigal-do--make-request-indicator context)))
+(defun madrigal-do--choose-context
+    (agent explicit &optional preview-face minibuffer-face scope)
+  "Choose context for AGENT, previewing it with PREVIEW-FACE.
+
+When SCOPE is non-nil, select that target without prompting."
+  (let* ((provider
+          (and (madrigal-llm-available-p)
+               (ignore-errors
+                 (car (madrigal-agent-controller--resolve-provider-and-model
+                       agent)))))
+         (limit (and provider (fboundp 'llm-chat-token-limit)
+                     (ignore-errors (llm-chat-token-limit provider))))
+         (madrigal-context-provider-limit limit)
+         (madrigal-context-provider-measure-function
+          (and provider (fboundp 'llm-count-tokens)
+               (lambda (text) (llm-count-tokens provider text)))))
+    (if explicit
+        (madrigal-do--call-with-minibuffer-indicator
+         (or minibuffer-face preview-face)
+         (lambda ()
+           (madrigal-context-choose t nil nil limit preview-face scope)))
+      (madrigal-context-choose nil nil nil limit preview-face scope))))
+
+(defun madrigal-do--read-context-instruction (&optional choose-scope scope)
+  "Select context, display it, and read an instruction.
+
+CHOOSE-SCOPE opens explicit scope completion.  SCOPE selects a target directly."
+  (let* ((accent (madrigal-do--next-request-accent))
+         (faces (madrigal-do--request-highlight-faces (car accent) (cdr accent)))
+         (preview-face (car faces))
+         (minibuffer-face (madrigal-do--point-mode-line-face (cdr faces)))
+         (context (madrigal-do--choose-context
+                   madrigal-do-agent choose-scope preview-face minibuffer-face
+                   scope))
+         (indicator (madrigal-do--make-request-indicator context accent)))
     (condition-case err
         (progn
           (redisplay t)
-          (list (read-string "Madrigal do: ") context indicator))
+          (list
+           (madrigal-do--call-with-minibuffer-indicator
+            (madrigal-do--indicator-mode-line-face indicator)
+            (lambda ()
+              (minibuffer-with-setup-hook
+                  (lambda () (redisplay t))
+                (read-string "Madrigal do: "))))
+           context indicator))
       ((error quit)
        (madrigal-do--delete-request-indicator indicator)
        (signal (car err) (cdr err))))))
 
-(defun madrigal-do (instruction context &optional indicator)
+(defun madrigal-do (instruction context &optional indicator scope)
   "Perform a stateless Madrigal action for plist CONTEXT.
 
-INDICATOR may be created before reading the interactive instruction."
-  (interactive (madrigal-do--read-focused-instruction))
+INDICATOR may be created before reading the interactive instruction.  When
+CONTEXT is nil, read the instruction after selecting the target SCOPE."
+  (interactive (madrigal-do--read-context-instruction current-prefix-arg))
+  (unless context
+    (pcase-let ((`(,read-instruction ,read-context ,read-indicator)
+                 (madrigal-do--read-context-instruction nil scope)))
+      (setq instruction read-instruction
+            context read-context
+            indicator read-indicator)))
   (condition-case err
       (madrigal-do--execute context instruction 'prompt indicator)
     ((error quit)
      (madrigal-do--delete-request-indicator indicator)
      (signal (car err) (cdr err)))))
 
-(defun madrigal-do-project (project &optional instruction)
-  "Perform a project-level Madrigal action for PROJECT."
-  (interactive (list (project-current t)))
-  (madrigal-do (or instruction (read-string "Madrigal do project: "))
-               (madrigal-project-action-context project)))
 
 (defun madrigal-do--json-response-text (text)
   "Return JSON from TEXT, removing an optional Markdown fence."
@@ -913,31 +1054,50 @@ INDICATOR may be created before reading the interactive instruction."
 
 (defun madrigal-do--parse-suggestion (entry)
   "Validate one action or prompt suggestion ENTRY."
-  (let ((relevance (plist-get entry :relevance)))
-    (unless (and (numberp relevance) (<= 0 relevance) (<= relevance 1))
-      (error "Invalid Madrigal suggestion relevance"))
-    (cond
-     ((plist-member entry :action)
-      (madrigal-do--require-json-keys entry '(:relevance :action) "suggestion")
-      (let ((action (plist-get entry :action)))
-        (madrigal-do--require-json-keys
-         action '(:description :tool_call) "action")
-        (madrigal-action-suggestion-create
-         :relevance relevance
-         :action
-         (list :description
-               (madrigal-do--suggestion-string
-                action :description madrigal-do--suggestion-description-limit)
-               :tool-call
-               (madrigal-do--validate-direct-tool-call
-                (plist-get action :tool_call))))))
-     ((plist-member entry :prompt)
-      (madrigal-do--require-json-keys entry '(:relevance :prompt) "suggestion")
-      (madrigal-action-suggestion-create
-       :relevance relevance
-       :prompt (madrigal-do--suggestion-string
-                entry :prompt madrigal-do--suggestion-prompt-limit)))
-     (t (error "Invalid Madrigal suggestion alternative")))))
+  (let* ((relevance (plist-get entry :relevance))
+         (confidence (or (plist-get entry :confidence) relevance))
+         (impact (or (plist-get entry :impact) "local"))
+         (reversibility (or (plist-get entry :reversibility) "reversible"))
+         (required-scope (plist-get entry :required_scope))
+         (alternative (cond ((plist-member entry :action) :action)
+                            ((plist-member entry :prompt) :prompt)))
+         (optional (seq-filter (lambda (key) (plist-member entry key))
+                               '(:confidence :impact :reversibility
+                                 :required_scope))))
+    (unless alternative
+      (error "Invalid Madrigal suggestion alternative"))
+    (madrigal-do--require-json-keys
+     entry (append (list :relevance alternative) optional) "suggestion")
+    (unless (and (numberp relevance) (<= 0 relevance) (<= relevance 1)
+                 (numberp confidence) (<= 0 confidence) (<= confidence 1)
+                 (member impact '("local" "buffer" "project" "session"))
+                 (member reversibility '("reversible" "review" "destructive")))
+      (error "Invalid Madrigal suggestion metadata"))
+    (let ((arguments (list :relevance relevance :confidence confidence
+                           :impact impact :reversibility reversibility
+                           :required-scope required-scope)))
+      (cond
+       ((plist-member entry :action)
+        (let ((action (plist-get entry :action)))
+          (madrigal-do--require-json-keys
+           action '(:description :tool_call) "action")
+          (apply #'madrigal-action-suggestion-create
+                 (append arguments
+                         (list :action
+                               (list :description
+                                     (madrigal-do--suggestion-string
+                                      action :description
+                                      madrigal-do--suggestion-description-limit)
+                                     :tool-call
+                                     (madrigal-do--validate-direct-tool-call
+                                      (plist-get action :tool_call))))))))
+       ((plist-member entry :prompt)
+        (apply #'madrigal-action-suggestion-create
+               (append arguments
+                       (list :prompt
+                             (madrigal-do--suggestion-string
+                              entry :prompt madrigal-do--suggestion-prompt-limit)))))
+       (t (error "Invalid Madrigal suggestion alternative"))))))
 
 (defun madrigal-do--parse-suggestions (text)
   "Parse TEXT, discarding malformed candidates independently."
@@ -985,9 +1145,7 @@ INDICATOR may be created before reading the interactive instruction."
 
 (defun madrigal-do--relevance-indicator (relevance)
   "Return a pie-circle indicator for RELEVANCE."
-  (cond
-   ((>= relevance 0.875) "●") ((>= relevance 0.625) "◕")
-   ((>= relevance 0.375) "◑") ((>= relevance 0.125) "◔") (t "○")))
+  (madrigal-context-relevance-indicator relevance))
 
 (defun madrigal-do--org-fontify-string (text)
   "Return TEXT with Org inline formatting properties."
@@ -1001,8 +1159,7 @@ INDICATOR may be created before reading the interactive instruction."
 (defun madrigal-do--suggestion-prefix (suggestion)
   "Return the relevance and kind prefix for SUGGESTION."
   (let* ((relevance (madrigal-action-suggestion-relevance suggestion))
-         (face (cond ((>= relevance 0.75) 'success)
-                     ((>= relevance 0.4) 'warning) (t 'shadow)))
+         (face (madrigal-context-relevance-face relevance))
          (icon (if (madrigal-do--suggestion-action-p suggestion) "⚡" "🧠")))
     (concat (propertize (madrigal-do--relevance-indicator relevance) 'face face)
             " " icon " ")))
@@ -1011,7 +1168,13 @@ INDICATOR may be created before reading the interactive instruction."
   "Return SUGGESTION in its completion display format."
   (concat (madrigal-do--suggestion-prefix suggestion)
           (madrigal-do--org-fontify-string
-           (madrigal-do--suggestion-label suggestion))))
+           (madrigal-do--suggestion-label suggestion))
+          (format "  [confidence %.0f%%; %s; %s]"
+                  (* 100 (or (madrigal-action-suggestion-confidence suggestion)
+                             (madrigal-action-suggestion-relevance suggestion)))
+                  (or (madrigal-action-suggestion-impact suggestion) "local")
+                  (or (madrigal-action-suggestion-reversibility suggestion)
+                      "reversible"))))
 
 (defun madrigal-do--suggestion-completion-table (candidates)
   "Return a categorized completion table for DWIM CANDIDATES."
@@ -1025,57 +1188,63 @@ INDICATOR may be created before reading the interactive instruction."
            . ,(lambda (labels)
                 (mapcar
                  (lambda (label)
-                   (list label
-                         (madrigal-do--suggestion-prefix
-                          (cdr (assoc label candidates)))
-                         ""))
+                   (let ((suggestion (cdr (assoc label candidates))))
+                     (list label
+                           (madrigal-do--suggestion-prefix suggestion)
+                           (format "  [confidence %.0f%%; %s; %s]"
+                                   (* 100 (or
+                                           (madrigal-action-suggestion-confidence
+                                            suggestion)
+                                           (madrigal-action-suggestion-relevance
+                                            suggestion)))
+                                   (or (madrigal-action-suggestion-impact suggestion)
+                                       "local")
+                                   (or
+                                    (madrigal-action-suggestion-reversibility
+                                     suggestion)
+                                    "reversible")))))
                  labels))))
       (complete-with-action action (mapcar #'car candidates) string pred))))
 
-(defun madrigal-do--read-suggestion (context suggestions)
+(defun madrigal-do--read-suggestion (context suggestions &optional minibuffer-face)
   "Read a candidate or custom instruction from SUGGESTIONS for CONTEXT."
-  (let* ((context (madrigal-focus-normalize-context context))
-         (buffer (madrigal-focus-context-origin-buffer context))
+  (let* ((context (madrigal-context-normalize context))
+         (buffer (madrigal-context-origin-buffer context))
          (project (plist-get context :project))
          (candidates (mapcar (lambda (suggestion)
                                (cons (madrigal-do--suggestion-label suggestion)
                                      suggestion))
                              suggestions))
-         (choice (completing-read
-                  (if buffer
-                      (format "Madrigal for %s (type or choose): " (buffer-name buffer))
-                    (format "Madrigal project %s (type or choose): "
-                            (plist-get project :name)))
-                  (madrigal-do--suggestion-completion-table candidates) nil nil)))
+         (choice
+          (madrigal-do--call-with-minibuffer-indicator
+           minibuffer-face
+           (lambda ()
+             (completing-read
+              (cond
+               (buffer
+                (format "Madrigal for %s (type or choose): "
+                        (buffer-name buffer)))
+               (project
+                (format "Madrigal project %s (type or choose): "
+                        (plist-get project :name)))
+               (t "Madrigal Emacs session (type or choose): "))
+              (madrigal-do--suggestion-completion-table candidates) nil nil)))))
     (unless (string-empty-p choice)
       (or (cdr (assoc choice candidates)) choice))))
 
-(defun madrigal-do--suggestion-focus-range (context)
-  "Return the source range included for CONTEXT's DWIM suggestions."
-  (let* ((context (madrigal-focus-normalize-context context))
-         (buffer-context (plist-get (plist-get context :origin) :buffer-context))
-         (range (plist-get buffer-context :range))
-         (point (madrigal-focus-context-point context)))
-    (when range
-      (if (or (not point) (null madrigal-do-dwim-context-limit))
-          range
-        (let* ((minimum (car range))
-               (maximum (cdr range))
-               (position (marker-position point))
-               (limit madrigal-do-dwim-context-limit)
-               (start (max minimum (- position (/ limit 2))))
-               (end (min maximum (+ position (- limit (/ limit 2))))))
-          (when (< (- end start) limit)
-            (setq start (max minimum (- end limit))))
-          (cons start end))))))
+(defun madrigal-do--suggestion-context-range (context)
+  "Return the complete selected range for CONTEXT."
+  (let* ((context (madrigal-context-normalize context))
+         (buffer-context (plist-get (plist-get context :origin) :buffer-context)))
+    (plist-get buffer-context :range)))
 
-(defun madrigal-do--suggestion-focus-text (context)
+(defun madrigal-do--suggestion-context-text (context)
   "Return unmodified text selected from CONTEXT."
-  (let* ((context (madrigal-focus-normalize-context context))
+  (let* ((context (madrigal-context-normalize context))
          (buffer-context (plist-get (plist-get context :origin) :buffer-context))
          (text (plist-get buffer-context :text))
          (buffer-range (plist-get buffer-context :range))
-         (range (madrigal-do--suggestion-focus-range context)))
+         (range (madrigal-do--suggestion-context-range context)))
     (if (and text buffer-range range)
         (substring text
                    (- (car range) (car buffer-range))
@@ -1084,9 +1253,9 @@ INDICATOR may be created before reading the interactive instruction."
 
 (defun madrigal-do--suggestion-context (context)
   "Return Lisp-data planning context derived from CONTEXT."
-  (let* ((context (madrigal-focus-normalize-context context))
+  (let* ((context (madrigal-context-normalize context))
          (origin (plist-get context :origin))
-         (point (madrigal-focus-context-point context))
+         (point (madrigal-context-point context))
          (instructions
           (cond
            ((null origin)
@@ -1094,17 +1263,17 @@ INDICATOR may be created before reading the interactive instruction."
            (point
             "Propose concrete actions relevant to the supplied text at point. Prefer local actions.")
            (t "Propose concrete actions relevant to the buffer as a whole.")))
-         (planning-context (madrigal-focus-model-context context)))
+         (planning-context (madrigal-context-model-data context)))
     (when origin
       (let* ((model-origin (plist-get planning-context :origin))
              (buffer-context (plist-get model-origin :buffer-context))
-             (range (madrigal-do--suggestion-focus-range context)))
+             (range (madrigal-do--suggestion-context-range context)))
         (when buffer-context
           (when range
             (setq buffer-context (plist-put buffer-context :range range))
             (setq buffer-context
                   (plist-put buffer-context :text
-                             (madrigal-do--suggestion-focus-text context))))
+                             (madrigal-do--suggestion-context-text context))))
           (setq model-origin (plist-put model-origin :buffer-context buffer-context))
           (setq planning-context (plist-put planning-context :origin model-origin)))))
     (concat
@@ -1114,6 +1283,7 @@ INDICATOR may be created before reading the interactive instruction."
        (list :instructions
              (list instructions
                    "Return a small set ordered by decreasing relevance."
+                   "For each suggestion estimate confidence, impact, reversibility, and any broader required_scope."
                    "Use action for one independently executable eval operation; use prompt for a Madrigal question, investigation, explanation, or plan."
                    "Do not perform an action or emit tool calls. Return only the requested structured response.")
              :context planning-context))))))
@@ -1158,17 +1328,18 @@ RENDERED-CONTEXT, when non-nil, is the prepared suggestion context."
 
 (defun madrigal-do--execute-immediate (context suggestion)
   "Execute SUGGESTION's single tool call directly against CONTEXT."
-  (let* ((context (madrigal-focus-normalize-context context))
+  (let* ((context (madrigal-context-normalize context))
          (tool-call
           (madrigal-do--validate-direct-tool-call
            (plist-get (madrigal-action-suggestion-action suggestion) :tool-call)))
-         (origin-buffer (madrigal-focus-context-origin-buffer context))
+         (origin-buffer (madrigal-context-origin-buffer context))
          (project (plist-get context :project))
          (buffer (or origin-buffer
-                     (let ((temporary
-                            (generate-new-buffer " *madrigal-project-immediate*")))
-                       (with-current-buffer temporary
-                         (setq default-directory (plist-get project :root)))
+                     (let ((temporary (generate-new-buffer
+                                       " *madrigal-immediate*")))
+                       (when project
+                         (with-current-buffer temporary
+                           (setq default-directory (plist-get project :root))))
                        temporary)))
          (operation (madrigal-immediate-action-create
                      :id (madrigal--next-request-id)
@@ -1191,7 +1362,7 @@ RENDERED-CONTEXT, when non-nil, is the prepared suggestion context."
         (condition-case err
             (progn
               (if origin-buffer
-                  (madrigal--call-with-focus-context context invoke)
+                  (madrigal--call-with-action-context context invoke)
                 (funcall invoke))
               (if (plist-get raw-result :ok)
                   (let ((text (madrigal-do--immediate-value-text
@@ -1224,6 +1395,22 @@ RENDERED-CONTEXT, when non-nil, is the prepared suggestion context."
 
 (defun madrigal-do--dispatch-suggestion (context selection indicator)
   "Dispatch SELECTION against CONTEXT, transferring INDICATOR when needed."
+  (when (and (madrigal-action-suggestion-p selection)
+             (madrigal-action-suggestion-required-scope selection)
+             (not (equal (madrigal-action-suggestion-required-scope selection)
+                         (plist-get (plist-get context :scope) :label))))
+    (madrigal-do--delete-request-indicator indicator)
+    (user-error "Suggestion requires scope %s; rerun with a prefix argument"
+                (madrigal-action-suggestion-required-scope selection)))
+  (when (and (madrigal-action-suggestion-p selection)
+             (madrigal-do--suggestion-action-p selection)
+             (or (member (madrigal-action-suggestion-impact selection)
+                         '("project" "session"))
+                 (member (madrigal-action-suggestion-reversibility selection)
+                         '("review" "destructive")))
+             (not (yes-or-no-p "Review this broad or risky Madrigal action? ")))
+    (madrigal-do--delete-request-indicator indicator)
+    (user-error "Madrigal action cancelled"))
   (cond
    ((stringp selection)
     (madrigal-do--execute context selection 'dwim indicator))
@@ -1243,7 +1430,10 @@ RENDERED-CONTEXT, when non-nil, is the prepared suggestion context."
     (condition-case visit-error
         (progn
           (madrigal-do--visit-context context)
-          (if-let* ((selection (madrigal-do--read-suggestion context suggestions)))
+          (if-let* ((selection
+                     (madrigal-do--read-suggestion
+                      context suggestions
+                      (madrigal-dwim-suggestion-request-ui-face request))))
               (progn
                 (madrigal-do--finish-dwim-suggestion request 'success text nil t)
                 (madrigal-do--dispatch-suggestion
@@ -1270,27 +1460,57 @@ RENDERED-CONTEXT, when non-nil, is the prepared suggestion context."
            request context suggestions text))
       (madrigal-do--offer-suggestions request context suggestions text))))
 
-(defun madrigal-do-dwim (action-context)
-  "Suggest immediate actions and prompts for plist ACTION-CONTEXT."
-  (interactive
-   (list (madrigal-focus-context
-          nil nil madrigal-do-dwim-context-limit)))
+(defun madrigal-do--read-dwim-context (choose-scope &optional scope)
+  "Read DWIM context, optionally prompting when CHOOSE-SCOPE is non-nil.
+
+SCOPE selects a target directly."
+  (let* ((accent (madrigal-do--next-request-accent))
+         (faces (madrigal-do--request-highlight-faces (car accent) (cdr accent)))
+         (preview-face (car faces))
+         (minibuffer-face (madrigal-do--point-mode-line-face (cdr faces))))
+    (list (madrigal-do--choose-context
+           (madrigal-do--dwim-model-agent) choose-scope
+           preview-face minibuffer-face scope)
+          accent)))
+
+(defun madrigal-do-dwim (action-context &optional accent scope)
+  "Suggest immediate actions and prompts for materialized ACTION-CONTEXT.
+
+With a prefix argument, select a scope before requesting suggestions.  When
+ACTION-CONTEXT is nil, select the target SCOPE without prompting."
+  (interactive (madrigal-do--read-dwim-context current-prefix-arg))
+  (unless action-context
+    (pcase-let ((`(,read-context ,read-accent)
+                 (madrigal-do--read-dwim-context nil scope)))
+      (setq action-context read-context
+            accent read-accent)))
   (unless (madrigal-llm-available-p)
     (user-error "The `llm' package is not available"))
-  (let* ((action-context (madrigal-focus-normalize-context action-context))
+  (let* ((action-context (madrigal-context-normalize action-context))
+         (_ (when-let* ((origin-buffer
+                         (madrigal-context-origin-buffer action-context)))
+              (unless (buffer-live-p origin-buffer)
+                (user-error
+                 "The captured Madrigal origin is no longer available"))))
          (resolved (madrigal-agent-controller--resolve-provider-and-model
                     (madrigal-do--dwim-model-agent)))
          (provider (car resolved))
          (model (cdr resolved))
          (context (madrigal-do--suggestion-context action-context))
          (prompt (madrigal-do--suggestion-prompt action-context context))
+         (indicator (madrigal-do--make-request-indicator action-context accent))
          (request (madrigal-dwim-suggestion-request-create
                    :id (madrigal--next-request-id)
                    :action-context action-context :provider provider :model model
                    :prompt prompt :context context :status 'running
-                   :started-at (current-time)
-                   :indicator (madrigal-do--make-request-indicator action-context))))
+                   :started-at (current-time) :indicator indicator
+                   :ui-face (or (madrigal-do--indicator-mode-line-face indicator)
+                                (madrigal-do--mode-line-face
+                                 (or accent (madrigal-do--next-request-accent)))))))
     (push request madrigal-do--active-dwim-suggestions)
+    (madrigal-do--refresh-mode-line)
+    (madrigal-do--ensure-spinner-timer)
+    (force-mode-line-update t)
     (message "Madrigal is finding likely actions...")
     (condition-case err
         (setf (madrigal-dwim-suggestion-request-handle request)
@@ -1326,10 +1546,6 @@ RENDERED-CONTEXT, when non-nil, is the prepared suggestion context."
        (madrigal-do--finish-dwim-suggestion request 'error nil err)
        (signal (car err) (cdr err))))))
 
-(defun madrigal-do-project-dwim (project)
-  "Suggest and execute a project-level action for PROJECT."
-  (interactive (list (project-current t)))
-  (madrigal-do-dwim (madrigal-project-action-context project)))
 
 (defun madrigal-do-cancel ()
   "Cancel the most recent active Madrigal action or suggestion request."
@@ -1343,11 +1559,9 @@ RENDERED-CONTEXT, when non-nil, is the prepared suggestion context."
                                    (madrigal-action-started-at action))))))
     (cond
      (action-newer-p
-      (madrigal-agent-controller-cancel (madrigal-action-handle action)))
+      (madrigal-do--cancel-action action))
      (request
-      (llm-cancel-request (madrigal-dwim-suggestion-request-handle request))
-      (madrigal-do--finish-dwim-suggestion request 'cancelled)
-      (message "Cancelled Madrigal action suggestions"))
+      (madrigal-do--cancel-dwim-suggestion request))
      (t (user-error "No active Madrigal action")))))
 
 (defun madrigal-do--status-face (status)
@@ -1494,7 +1708,7 @@ TIME-FUNCTION and STATUS-FUNCTION extract annotation data from each record."
   "Insert plist CONTEXT beneath a Context heading."
   (insert "* Context\n")
   (madrigal-do--insert-elisp-data
-   (madrigal-focus-model-context context)))
+   (madrigal-context-model-data context)))
 
 (defun madrigal-do--render-history (action)
   "Render ACTION's turns and tool use in a read-only Org buffer."

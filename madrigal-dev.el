@@ -7,7 +7,7 @@
     (add-to-list 'load-path dir)))
 
 (defun madrigal-dev-reload ()
-  "Reload all Madrigal source modules from this directory." 
+  "Reload all Madrigal source modules from this directory."
   (interactive)
   (let* ((dir (file-name-directory (or load-file-name buffer-file-name default-directory)))
          (self (file-name-nondirectory (or load-file-name buffer-file-name "madrigal-dev.el")))

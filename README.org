@@ -5,14 +5,14 @@ This is a read-only GitHub mirror of the [[https://nest.pijul.com/fitzgibbon/mad
 #+end_quote
 
 Madrigal lets an LLM operate a live Emacs rather than merely describe what you
-could do yourself. It works from a focused, mode-aware view of the current
+could do yourself. It works from a context-aware view of the current
 buffer and keeps requests asynchronous so you can continue working.
 
 Use =madrigal-do= when you know the instruction you want to give. Use
 =madrigal-do-dwim= when you want Madrigal to suggest a short list of actions
 for the context at point. Both start fresh requests without carrying chat
-history between actions. Project-only versions are available when an action
-should receive project metadata but no buffer contents.
+history between actions. Use a prefix argument to choose project metadata or
+another available context explicitly.
 
 Madrigal also provides optional, persistent Org conversations through the
 =assistant= and =babel-assistant= agents.
@@ -40,10 +40,7 @@ available model names. This example uses the OpenAI Responses provider:
   :after (llm llm-openai-responses)
   :bind
   (("C-:" . madrigal-do)
-   ("C-\"" . madrigal-do-dwim)
-   :map project-prefix-map
-   (":" . madrigal-do-project)
-   ("\"" . madrigal-do-project-dwim))
+   ("C-\"" . madrigal-do-dwim))
   :config
   (setq madrigal-providers
         `(("OpenAI"
@@ -63,12 +60,12 @@ different backend. Without an explicit selection, =do= uses the =assistant=
 selection, while =do-dwim= uses =do= and then =assistant= as its fallback
 chain.
 
-** Focused actions
+** Context actions
 
 *** =madrigal-do=
 
 Use =M-x madrigal-do= when you know what you want Emacs to accomplish at point.
-Enter a focused instruction such as renaming the current definition, fixing a
+Enter a instruction such as renaming the current definition, fixing a
 diagnostic, reorganising a subtree, or changing an Emacs setting. Madrigal
 returns either a brief unformatted result in the echo area or a standalone Org
 document in a read-only Org-mode window named by the model and prefixed with
@@ -87,22 +84,10 @@ menu, ⚡ marks an immediate action and 🧠 marks a =madrigal-do= prompt:
 - A prompt is sent through the ordinary =madrigal-do= executor. Questions,
   investigations, explanations, and plans use this path.
 
-Editing a candidate or entering custom text always creates an ordinary focused
+Editing a candidate or entering custom text always creates an ordinary context
 action. Quitting performs nothing. Suggestion generation and menu display are
 tool-free; no operation runs until selection. A killed or otherwise stale origin
 prevents either alternative from running.
-
-*** =madrigal-do-project=
-
-Use =M-x madrigal-do-project= when you know what you want to accomplish for the
-current project rather than the buffer at point. The current buffer does not
-influence the request.
-
-*** =madrigal-do-project-dwim=
-
-Use =M-x madrigal-do-project-dwim= when you want Madrigal to suggest useful
-project actions without taking the current buffer into account. Choose a
-suggestion or enter your own project instruction.
 
 *** How actions operate Emacs
 
@@ -116,23 +101,35 @@ it:
 
 *** Context selection
 
-Focused actions include the buffer text around point, the active modes, and
-project metadata when available. Madrigal chooses a useful unit for the current
-mode, such as a declaration, outline subtree, section, table row, or nearby
-lines.
+Context actions discover local syntax, text, buffer, project, and Emacs-session
+scopes from one frozen capture. Structural providers understand Lisp and
+Tree-sitter forms, Org subtrees, Magit sections, diff hunks and files,
+compilation diagnostics, Dired and tabulated-list entries, message bodies and
+headers, and Comint interactions. Notmuch scopes distinguish individual mail
+from threads; Ement scopes distinguish room-list entries, timeline events, and
+whole room timelines. Notmuch and Ement are optional: Madrigal neither requires
+nor loads them, and their providers become applicable automatically when their
+major modes are in use. Without a prefix argument, both commands use the
+highest-scoring scope; an active region always takes precedence. Project and
+Emacs-session scopes have relevance zero and therefore sort below ordinary
+document scopes.
 
-Use =madrigal-do-buffer-context-limit= to limit the context sent for action
-execution and =madrigal-do-dwim-context-limit= to limit suggestion context. A
-mode can provide a custom selector by setting the buffer-local
-=madrigal-focus-context-range-function= in its mode hook.
+Use a prefix argument with =madrigal-do= or =madrigal-do-dwim= to choose from
+all discovered scopes before any request is made. Completion shows each dynamic
+label, provider, size, and relevance score, and previews document ranges.
+Selection is confirmed with RET; quitting makes no request. During an action,
+=madrigal-do-expand-context= can explicitly read a related enclosing candidate
+from the frozen capture, leaving the original action context unchanged.
 
 *** Concurrent requests and cancellation
 
 Requests run asynchronously, and you can have more than one active at a time.
 The mode line shows 🧠 followed by one coloured spinner per active
 =madrigal-do= request. Each spinner uses the colour of that request's origin
-highlight. On completion it becomes a matching ✓ or ✗ for two seconds.
-=M-x madrigal-do-cancel= cancels the newest active action or suggestion request.
+highlight. Left-click a spinner to visit its highlighted context; right-click
+it to cancel that request. On completion it becomes a matching ✓ or ✗ for two
+seconds. =M-x madrigal-do-cancel= cancels the newest active action or suggestion
+request.
 
 *** History and inspection
 
