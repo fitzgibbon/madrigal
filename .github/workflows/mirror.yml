@@ -39,6 +39,18 @@ jobs:
             --exclude=.github/ \
             "$RUNNER_TEMP/madrigal/" ./
 
+      - name: Mark README as a mirror
+        run: |
+          {
+            IFS= read -r title
+            printf '%s\n\n' "$title"
+            printf '%s\n' '#+begin_quote'
+            printf '%s\n' 'This is a read-only GitHub mirror of the [[https://nest.pijul.com/fitzgibbon/madrigal][upstream repository on Pijul Nest]].'
+            printf '%s\n\n' '#+end_quote'
+            cat
+          } < README.org > README.org.mirror
+          mv README.org.mirror README.org
+
       - name: Commit changes
         run: |
           git config user.name "Madrigal mirror"
