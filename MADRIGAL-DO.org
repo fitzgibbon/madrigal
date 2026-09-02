@@ -1,0 +1,130 @@
+#+TITLE: Madrigal Do Implementation Plan
+
+* Goals
+
+- Add =madrigal-do= for one-shot, prompt-driven Emacs actions.
+- Add =madrigal-do-dwim= to propose likely actions through minibuffer completion and execute the selected instruction through the same path as =madrigal-do=.
+- Keep actions stateless across invocations: no conversational buffer and no previous action history in model context.
+- Capture focused actions as plists with a live buffer, optional window, optional point-local buffer context, and optional project.
+- Store action and tool lifecycle data in bounded Lisp records rather than Org text.
+- Allow Madrigal sessions and actions outside projects while including project information when available.
+- Reduce the eager eval-tool prompt by moving runtime and package information behind bounded reflection functions.
+- Improve existing Org-session responsiveness by caching and debouncing context work.
+- Give assistant and focused-action agents a persistent reusable Emacs Lisp library.
+
+* Current implementation status
+
+- Added optional project discovery and non-project Org sessions.
+- Added project context to existing session requests.
+- Added bounded plist focus contexts containing buffer, cursor, region, window, and optional project data.
+- Eval calls re-enter the captured buffer and live window at tracked point/mark markers, even after the user moves focus or edits preceding text.
+- Added UI-independent eval event sinks while preserving Org rendering.
+- Added =madrigal-do= with 1000-item default retention for Lisp action, turn, tool, and tool-result records.
+- Added tool-free =madrigal-do-dwim= suggestions using a provider-independent JSON schema, strict validation, and minibuffer selection through the shared executor.
+- Added bounded reflection entry points, action self-introspection helpers, and a reduced eager eval-tool description.
+- Added history/token caching and idle-delayed Org context refreshes.
+- Added initial ERT coverage and user documentation.
+- Added =persist-elisp=, which evaluates reusable agent code and stores it in one
+  file beneath =user-emacs-directory=, loaded whenever Madrigal starts.
+- Updated assistant and focused-action prompts to build and reuse that library.
+
+Remaining work is recorded in the phase checklists below, particularly richer stale-suggestion handling, a fully typed controller execution context, broader reflection coverage, and architecture diagrams.
+
+* Architecture
+
+** Execution context
+
+Use a validated execution context carrying the request id, origin buffer and marker, focus context, and event sink. Tool execution produces a structured event, and UI adapters decide whether to render it in Org or retain it in an action record.
+
+** Focus context
+
+Capture focus before opening a minibuffer. Use a validated plist with reserved =:origin= and =:project= entries. Nest major mode, minor modes, optional point, region, range, and text beneath =:origin :buffer-context=. Omit point for whole-buffer actions. Retain live Emacs objects internally and replace them with descriptive data before serialization.
+
+** Project context
+
+Normal interactive actions discover optional project metadata. Project action commands provide only project name, root, and backend, with no buffer, mode, window, point, or text context. Derive eval directories privately from the origin buffer or project root rather than adding them to model context.
+
+** Action records
+
+Use bounded =madrigal-action= and =madrigal-tool-event= structures for active and recent requests. Tool calls and results remain in the transient =llm= prompt while a request is active but are never included in a later action automatically.
+
+** Commands
+
+- =madrigal-do=: capture plist focus context, read an instruction, execute it.
+- =madrigal-do-dwim=: capture focus, request ranked structured suggestions without tools, offer them through =completing-read=, and pass the selected or custom instruction to the same executor used by =madrigal-do=.
+- =madrigal-do-project= and =madrigal-do-project-dwim=: run the corresponding command with project-only context.
+- Add cancellation and inspection commands for active and recent actions.
+
+** Prompt design
+
+Use a minimal stable system prompt for execution. Mark captured editor content as data rather than instructions. The sole execution tool is Emacs Lisp eval. Suggestion generation receives the same focus context but no tools and cannot alter Emacs.
+
+** Reflection
+
+Provide bounded discovery for runtime details, packages, features, functions, variables, commands, key bindings, modes, project information, and focus-buffer slices. Search responses carry truncation and offset metadata. Avoid eagerly listing installed packages or all prelude documentation in the eval tool description.
+
+** Existing Org sessions
+
+Keep Org as the editable persistence format. Add concise working-directory/project context to each request. Separate eval execution from Org rendering. Cache parsed history and token information, mark it dirty on edits, and debounce expensive mode-line and compaction calculations.
+
+* Implementation phases
+
+** IN-PROGRESS Phase 1: optional project context
+
+- Make project discovery non-signalling.
+- Distinguish session working directory from optional project context.
+- Open in-memory and file-backed sessions outside projects.
+- Add environment context to existing session requests.
+- Add tests and update documentation.
+
+** IN-PROGRESS Phase 2: focus contexts
+
+- Add validated focus and project plists.
+- Capture buffer, point, region, and window information.
+- Implement bounded buffer serialization.
+- Test file, non-file, narrowed, region, project, and non-project buffers.
+
+** IN-PROGRESS Phase 3: UI-independent eval events
+
+- Add an execution-context record and event-sink protocol.
+- Separate eval calculation, compact callback result, and presentation.
+- Preserve the current Org adapter.
+- Add an in-memory action adapter and tests.
+
+** IN-PROGRESS Phase 4: =madrigal-do=
+
+- Add the minimal =do= agent.
+- Add action and tool-event records with bounded retention.
+- Implement the shared executor and minibuffer-only final-summary presentation.
+- Add cancellation and inspection.
+- Test request construction, continuation, result storage, and lack of cross-action history.
+
+** IN-PROGRESS Phase 5: =madrigal-do-dwim=
+
+- Add a tool-free suggestion request.
+- Request, parse, and validate ranked JSON-schema suggestions for every provider.
+- Add annotated, non-strict minibuffer completion.
+- Preserve the original context through selection.
+- Handle cancellation, stale/killed origins, and occupied minibuffers.
+- Test suggested, edited, custom, cancelled, and stale selections.
+
+** IN-PROGRESS Phase 6: bounded reflection
+
+- Add focus, runtime, package, feature, symbol, command, keymap, mode, project, and current-action history queries.
+- Add pagination and result limits.
+- Replace the eager eval-tool runtime/package/prelude text with short discovery guidance.
+- Test limits and serialization.
+
+** IN-PROGRESS Phase 7: Org performance
+
+- Cache parsed history and context token information.
+- Invalidate caches cheaply after edits.
+- Debounce mode-line refreshes.
+- Reuse one calculation for status and automatic compaction.
+- Add tests for invalidation and scheduling.
+
+** IN-PROGRESS Phase 8: documentation and integration
+
+- Document commands, configuration, result UI, scope rules, and privacy/context limits.
+- Update architecture diagrams.
+- Run byte compilation, ERT, and package checks.

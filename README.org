@@ -1,0 +1,205 @@
+* Madrigal
+
+Madrigal lets an LLM operate a live Emacs rather than merely describe what you
+could do yourself. It works from a focused, mode-aware view of the current
+buffer and keeps requests asynchronous so you can continue working.
+
+Use =madrigal-do= when you know the instruction you want to give. Use
+=madrigal-do-dwim= when you want Madrigal to suggest a short list of actions
+for the context at point. Both start fresh requests without carrying chat
+history between actions. Project-only versions are available when an action
+should receive project metadata but no buffer contents.
+
+Madrigal also provides optional, persistent Org conversations through the
+=assistant= and =babel-assistant= agents.
+
+** Installation
+
+Madrigal requires Emacs 29.1 or later and depends on [[https://github.com/ahyatt/llm][llm.el]]. Obtain its
+source and add the directory to =load-path=. For example, with Pijul:
+
+#+begin_src shell
+pijul clone https://nest.pijul.com/fitzgibbon/madrigal
+#+end_src
+
+Configure an =llm.el= provider, then give Madrigal the provider object and its
+available model names. This example uses the OpenAI Responses provider:
+
+#+begin_src emacs-lisp
+(use-package llm-openai-responses
+  :ensure nil
+  :after llm
+  :config
+  (setq my-madrigal-openai-provider
+        (make-llm-openai-responses
+         :key "<OPENAI_API_KEY>"
+         :chat-model "gpt-5.6-terra"
+         :reasoning-summary "auto"
+         :embedding-model "text-embedding-3-small")))
+
+(use-package madrigal
+  :ensure nil
+  :load-path "/path/to/madrigal"
+  :after (llm llm-openai-responses)
+  :bind
+  (("C-:" . madrigal-do)
+   ("C-\"" . madrigal-do-dwim)
+   :map project-prefix-map
+   (":" . madrigal-do-project)
+   ("\"" . madrigal-do-project-dwim))
+  :config
+  (setq madrigal-providers
+        `(("OpenAI"
+           :provider ,my-madrigal-openai-provider
+           :models ("gpt-5.6-sol"
+                    "gpt-5.6-terra"
+                    "gpt-5.6-luna"))))
+  (setq madrigal-agent-models
+        '(("assistant" . ("OpenAI" . "gpt-5.6-terra"))
+          ("babel-assistant" . ("OpenAI" . "gpt-5.6-terra"))
+          ("do" . ("OpenAI" . "gpt-5.6-terra"))
+          ("do-dwim" . ("OpenAI" . "gpt-5.6-luna")))))
+#+end_src
+
+Replace the key placeholder and use your provider's constructor if you prefer a
+different backend. Without an explicit selection, =do= uses the =assistant=
+selection, while =do-dwim= uses =do= and then =assistant= as its fallback
+chain.
+
+** Focused actions
+
+*** =madrigal-do=
+
+Use =M-x madrigal-do= when you know what you want Emacs to accomplish at point.
+Enter a focused instruction such as renaming the current definition, fixing a
+diagnostic, reorganising a subtree, or changing an Emacs setting. Madrigal does
+the work and reports the result with a brief summary.
+
+*** =madrigal-do-dwim=
+
+Use =M-x madrigal-do-dwim= when the useful next action is apparent from the
+current context but you do not want to formulate it yourself. Choose one of
+Madrigal's suggestions or enter your own instruction; Madrigal then carries out
+the selected action.
+
+*** =madrigal-do-project=
+
+Use =M-x madrigal-do-project= when you know what you want to accomplish for the
+current project rather than the buffer at point. The current buffer does not
+influence the request.
+
+*** =madrigal-do-project-dwim=
+
+Use =M-x madrigal-do-project-dwim= when you want Madrigal to suggest useful
+project actions without taking the current buffer into account. Choose a
+suggestion or enter your own project instruction.
+
+*** How actions operate Emacs
+
+After you give or select an instruction, Madrigal can use two tools to complete
+it:
+
+- =eval= inspects live Emacs state, invokes commands, and changes buffers or
+  configuration.
+- =persist-elisp= adds or updates reusable Emacs Lisp definitions for future
+  requests and normal interactive use.
+
+*** Context selection
+
+Focused actions include the buffer text around point, the active modes, and
+project metadata when available. Madrigal chooses a useful unit for the current
+mode, such as a declaration, outline subtree, section, table row, or nearby
+lines.
+
+Use =madrigal-do-buffer-context-limit= to limit the context sent for action
+execution and =madrigal-do-dwim-context-limit= to limit suggestion context. A
+mode can provide a custom selector by setting the buffer-local
+=madrigal-focus-context-range-function= in its mode hook.
+
+*** Concurrent requests and cancellation
+
+Requests run asynchronously, and you can have more than one active at a time.
+=M-x madrigal-do-cancel= cancels the newest active action or suggestion request.
+
+*** History and inspection
+
+Use =M-x madrigal-do-history= to browse running and completed actions. Use
+=M-x madrigal-do-dwim-history= to inspect suggestion requests, including their
+context, response, status, and timing.
+
+Completed action and suggestion records share the
+=madrigal-do-history-length= limit, which defaults to 1000.
+
+** Persistent Emacs Lisp
+
+The =persist-elisp= tool evaluates reusable definitions and stores them in
+=madrigal-persisted-elisp.el= under =user-emacs-directory=. Set
+=madrigal-persistent-elisp-file= to use another path. Persisting the same
+function or variable again replaces its previous definition.
+
+Agents can inspect this library through =madrigal-persisted-elisp-info=,
+=madrigal-persisted-elisp-help=, and =madrigal-persisted-elisp-source=.
+
+** Org sessions
+
+*** Assistant
+
+=M-x madrigal-open-session= opens a persistent, editable Org conversation with
+the =assistant= agent. Write beneath the open =* User= heading and submit with
+=C-c C-c=. The assistant replies in Org and can use =eval= and =persist-elisp=
+to inspect or modify Emacs.
+
+With a prefix argument, =madrigal-open-session= opens a =.madrigal.org= file
+instead of an in-memory session. Files ending in =.madrigal.org=, or containing
+=#+MADRIGAL-AGENT:=, activate Madrigal mode automatically.
+
+Session controls include:
+
+- =C-c C-k= cancels outstanding requests.
+- =C-c M-c= compacts older transcript context.
+- A top-level subtree tagged =:exclude:= is omitted from future model context.
+
+*** Babel assistant
+
+The =babel-assistant= agent uses an Org =* Request= turn. It inserts and
+executes complete Org Babel blocks, retains each block and result in the
+transcript, and finishes with an Org response.
+
+Enable Babel languages normally, then optionally restrict which languages the
+agent may use:
+
+#+begin_src emacs-lisp
+(use-package ob
+  :ensure nil
+  :config
+  (org-babel-do-load-languages
+   'org-babel-load-languages
+   '((emacs-lisp . t)
+     (python . t)))
+  (setq madrigal-babel-allowed-languages '(emacs-lisp python)))
+#+end_src
+
+** Authority and trust
+
+Madrigal is an operator, not a sandbox. The =eval= and =persist-elisp= tools can
+execute Emacs Lisp with the authority of your Emacs process. Babel blocks have
+the same authority as blocks you execute interactively. Review provider privacy
+and retention policies before sending buffer or project context, and only use
+models and prompts you trust with this access.
+
+** Lisp contexts
+
+Lisp callers may pass a context plist to =madrigal-do= or
+=madrigal-do-dwim=. Reserved metadata lives under =:origin= and =:project=.
+The origin may contain =:buffer=, =:window=, and =:buffer-context=; buffer
+context may contain =:point=, =:major-mode=, =:minor-modes=, =:range=, =:text=,
+and =:region=. Omitting =:point= requests a buffer-wide operation. Additional
+top-level fields pass through as custom context.
+
+** Development
+
+Run the ERT suite in a clean batch Emacs:
+
+#+begin_src shell
+make test
+#+end_src

@@ -1,0 +1,175 @@
+#+TITLE: Madrigal Package Development Workflow
+
+* Goal
+
+Madrigal develops ordinary, reusable Emacs packages from source repositories.
+Package source on disk is authoritative: persistent definitions are written to
+package files before they are evaluated in the live Emacs session.
+
+The existing Nix configuration remains responsible for installed packages,
+their dependencies, system dependencies, and deployed revisions.  Madrigal
+adds temporary local source overlays only to the running Emacs while a package
+is under development.
+
+* Invariants
+
+- Every persistent live definition under development comes from a package file
+  in its source repository.
+- Madrigal records which source path and content hash supplied each loaded
+  development feature.
+- The loaded and on-disk hashes must agree before a package is reported as
+  synchronized.
+- Raw evaluation may call and inspect package code, but must not introduce
+  persistent named definitions outside package source.
+- Nix remains the deployed source of truth after development finishes.
+- Madrigal never treats a mixture of local and Nix definitions for one feature
+  as synchronized.
+
+* Nix and =use-package=
+
+The configuration uses =emacsWithPackagesFromUsePackage= with
+=alwaysEnsure = true=.  Its Nix parser selects packages from the
+=use-package= name and the =:ensure= and =:disabled= keywords.  It does not
+interpret =:load-path=.
+
+At runtime, Emacs evaluates =:load-path= and prepends the directory before
+loading the package.  A declaration such as:
+
+#+begin_src emacs-lisp
+(use-package example-package
+  :load-path "/home/niall/src/example-package"
+  :demand t)
+#+end_src
+
+therefore builds =epkgs.example-package= through Nix while preferring the local
+copy at runtime.  =:demand t= causes =use-package= to require the package
+immediately.  It does not replace a feature that is already loaded.
+
+A persistent =:load-path= would continue to shadow Nix after reboot, however.
+Madrigal should consequently install development paths dynamically rather than
+add them permanently to the user's configuration.  Packages intentionally
+maintained only as local source may instead use =:ensure nil= and a permanent
+=:load-path=.
+
+* Development workflow
+
+** Resolve and clone
+
+Given a symbol, feature, or package, Madrigal:
+
+1. Locates the loaded library with =symbol-file= and =locate-library=.
+2. Identifies the Nix package and deployed source revision.
+3. Resolves the upstream from package metadata, the corresponding flake input,
+   nixpkgs or MELPA metadata, or an explicit user choice.
+4. Reuses or clones a normal source repository under the user's source tree.
+5. Fetches the upstream and reports the relationship between the deployed,
+   local, and upstream revisions.
+6. Creates a development branch without resetting or overwriting existing
+   work.
+
+Repository operations must respect the repository's native version-control
+system.  Pulling, rebasing, resetting, pushing, and opening a pull request
+require an explicit operation; dirty work must never be changed implicitly.
+
+** Activate the local source
+
+Madrigal activates the checkout only in the running Emacs:
+
+1. Disable and unload the feature and affected dependents where safe.
+2. Add the checkout to the front of =load-path=.
+3. Load the canonical package files from the checkout.
+4. Reload dependents and restore previously enabled modes.
+5. Verify that relevant symbols resolve inside the checkout rather than the
+   Nix store.
+
+If the package cannot be unloaded safely, Madrigal reports that a restart is
+required rather than partially replacing it.
+
+** Edit, evaluate, and test
+
+For every change Madrigal:
+
+1. Reads the current package files and their hashes.
+2. Applies edits to canonical source using expected hashes to prevent lost
+   updates.
+3. Parses and byte-compiles the changed package in a clean subprocess.
+4. Runs focused ERT tests and other configured checks.
+5. Loads the exact saved source into the live Emacs.
+6. Evaluates calls and exploratory expressions against the loaded package.
+7. Runs relevant live tests.
+8. Confirms that loaded source and disk hashes agree.
+
+Compilation artifacts are produced outside the repository.  Stale local =.elc=
+files must not be allowed to shadow newer source.
+
+Package code must use standard Emacs package conventions and separate reusable
+behavior from personal configuration.  Hard dependencies belong in
+=Package-Requires=; optional integrations are guarded; user policy is supplied
+through arguments, options, callbacks, or adapter features.  Clean-process
+checks detect accidental dependencies on the current live session.
+
+** Submit upstream
+
+When checks pass, Madrigal can:
+
+1. Show repository status and the complete diff.
+2. Record focused commits or Pijul changes.
+3. Push a development branch with approval.
+4. Open and track a pull request.
+5. Record the exact submitted revision.
+
+The local checkout remains available while the change is reviewed, but it is
+not a deployed package source.
+
+** Persist through Nix
+
+After the change merges:
+
+- For a direct flake input, update the corresponding =<package>-src= lock entry.
+- For an =epkgs= package from nixpkgs, wait for or contribute the relevant
+  MELPA or nixpkgs source update, then update the nixpkgs lock entry.
+- Run targeted builds followed by =nix flake check -L --show-trace=.
+- Switch with =nh os switch --no-nom=.
+- Restart or reload Emacs so it uses the rebuilt package.
+- Remove the local development path and verify that =symbol-file= resolves to
+  the expected Nix store path.
+
+A local source override may be used to test a Nix build before merge, but an
+unchanged nixpkgs package cannot deploy an upstream revision it does not yet
+reference.
+
+* Package lifecycle requirements
+
+Packages intended for live development should be reload-safe where practical:
+
+- avoid irreversible top-level side effects;
+- expose explicit enable and disable operations;
+- make activation idempotent;
+- use named hook and advice functions;
+- remove hooks and advice during deactivation;
+- define an unload function when cleanup is necessary.
+
+Changes to live structures, classes, macros used by loaded dependents, or
+external process protocols may require an Emacs restart.  Source remains saved
+and testable even when immediate live replacement is unsafe.
+
+* Madrigal operations
+
+The intended user-facing operations are:
+
+- =develop-package=: resolve, clone, branch, and activate a checkout;
+- =package-status=: compare deployed, upstream, disk, loaded, and submitted
+  revisions;
+- =package-apply=: edit canonical package files transactionally;
+- =package-check=: run clean compilation, linting, and tests;
+- =package-reload=: load saved package source into the live session;
+- =package-sync=: fetch and report upstream divergence;
+- =package-submit=: record, push, and open a pull request;
+- =package-deploy=: update Nix locks, check, switch, and verify;
+- =stop-developing-package=: restore the Nix-provided package without deleting
+  the checkout.
+
+Madrigal may implement the runtime overlay by adding the checkout directly to
+=load-path= or by evaluating a temporary =use-package= declaration with
+=:ensure nil=, =:load-path=, and =:demand t=.  In either case it must explicitly
+unload an already loaded Nix feature before loading the local implementation.

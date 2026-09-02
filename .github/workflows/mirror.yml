@@ -1,0 +1,50 @@
+name: Mirror Pijul Nest
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 * * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mirror-pijul-nest
+  cancel-in-progress: true
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out GitHub mirror
+        uses: actions/checkout@v4
+
+      - name: Install Pijul
+        uses: fossdd/action-setup-pijul@dd2a43ca13393f17ae3938a10832d3c07ce70cc5 # v1
+
+      - name: Clone authoritative repository
+        run: |
+          pijul clone \
+            https://nest.pijul.com/fitzgibbon/madrigal \
+            "$RUNNER_TEMP/madrigal"
+
+      - name: Synchronize working tree
+        run: |
+          rsync -a --delete \
+            --exclude=.pijul/ \
+            --exclude=.git/ \
+            --exclude=.github/ \
+            "$RUNNER_TEMP/madrigal/" ./
+
+      - name: Commit changes
+        run: |
+          git config user.name "Madrigal mirror"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+
+          if git diff --cached --quiet; then
+            echo "Mirror is current"
+          else
+            git commit -m "Mirror Pijul Nest"
+            git push
+          fi
