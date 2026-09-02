@@ -36,7 +36,6 @@ jobs:
           rsync -a --delete \
             --exclude=.pijul/ \
             --exclude=.git/ \
-            --exclude=.github/ \
             "$RUNNER_TEMP/madrigal/" ./
 
       - name: Mark README as a mirror
