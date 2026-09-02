@@ -43,6 +43,7 @@ jobs:
         run: |
           {
             IFS= read -r title
+            IFS= read -r _
             printf '%s\n\n' "$title"
             printf '%s\n' '#+begin_quote'
             printf '%s\n' 'This is a read-only GitHub mirror of the [[https://nest.pijul.com/fitzgibbon/madrigal][upstream repository on Pijul Nest]].'
