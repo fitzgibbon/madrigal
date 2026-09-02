@@ -3,7 +3,7 @@ name: Mirror Pijul Nest
 on:
   workflow_dispatch:
   schedule:
-    - cron: "17 * * * *"
+    - cron: "0 * * * *"
 
 permissions:
   contents: write
@@ -36,6 +36,7 @@ jobs:
           rsync -a --delete \
             --exclude=.pijul/ \
             --exclude=.git/ \
+            --exclude=.github/workflows/mirror.yml \
             "$RUNNER_TEMP/madrigal/" ./
 
       - name: Mark README as a mirror
