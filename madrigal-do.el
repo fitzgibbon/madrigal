@@ -91,10 +91,6 @@ that accent over the default background at separate context and point strengths.
 (cl-defstruct (madrigal-action-suggestion
                (:constructor madrigal-action-suggestion-create))
   relevance
-  confidence
-  impact
-  reversibility
-  required-scope
   action
   prompt)
 
@@ -181,10 +177,6 @@ that accent over the default background at separate context and point strengths.
   (setq global-mode-string '("")))
 (add-to-list 'global-mode-string madrigal-do--mode-line-entry t)
 
-(defconst madrigal-do--suggestion-max-count 8)
-(defconst madrigal-do--suggestion-description-limit 80)
-(defconst madrigal-do--suggestion-prompt-limit 500)
-(defconst madrigal-do--direct-source-limit 4000)
 (defconst madrigal-do--diagnostic-limit 8)
 
 (defun madrigal-do--next-request-accent ()
@@ -461,13 +453,15 @@ Mouse-1 visits CONTEXT.  Mouse-3 calls CANCEL-FUNCTION."
     (:result
      (:anyOf
       [(:type "object" :properties
-        (:echo (:type "string" :minLength 1 :maxLength 240))
+        (:echo (:type "string" :minLength 1))
         :required ["echo"] :additionalProperties :false)
        (:type "object" :properties
         (:document
          (:type "object" :properties
-          (:name (:type "string" :minLength 1 :maxLength 80)
-           :content (:type "string" :minLength 1))
+          (:name (:type "string" :minLength 1)
+           :content
+           (:type "string" :minLength 1
+            :description "An Org mode document body."))
           :required ["name" "content"] :additionalProperties :false))
         :required ["document"] :additionalProperties :false)]))
     :required ["result"] :additionalProperties :false)
@@ -477,42 +471,24 @@ Mouse-1 visits CONTEXT.  Mouse-3 calls CANCEL-FUNCTION."
   `(:type "object"
     :properties
     (:suggestions
-     (:type "array" :maxItems ,madrigal-do--suggestion-max-count
+     (:type "array"
       :items
       (:anyOf
        [(:type "object"
          :properties
          (:relevance (:type "number" :minimum 0 :maximum 1)
-          :confidence (:type "number" :minimum 0 :maximum 1)
-          :impact (:type "string" :enum ["local" "buffer" "project" "session"])
-          :reversibility (:type "string" :enum ["reversible" "review" "destructive"])
-          :required_scope (:anyOf [(:type "string") (:type "null")])
-          :action
-          (:type "object"
-           :properties
-           (:description
-            (:type "string" :maxLength ,madrigal-do--suggestion-description-limit)
-            :tool_call
-            (:type "object"
-             :properties
-             (:name (:type "string" :enum ["eval"])
-              :arguments
-              (:type "object"
-               :properties
-               (:source (:type "string" :maxLength ,madrigal-do--direct-source-limit))
-               :required ["source"] :additionalProperties :false))
-             :required ["name" "arguments"] :additionalProperties :false))
-           :required ["description" "tool_call"] :additionalProperties :false))
-         :required ["relevance" "confidence" "impact" "reversibility" "required_scope" "action"] :additionalProperties :false)
+          :do-prompt (:type "string" :minLength 1))
+         :required ["relevance" "do-prompt"]
+         :additionalProperties :false)
         (:type "object"
          :properties
          (:relevance (:type "number" :minimum 0 :maximum 1)
-          :confidence (:type "number" :minimum 0 :maximum 1)
-          :impact (:type "string" :enum ["local" "buffer" "project" "session"])
-          :reversibility (:type "string" :enum ["reversible" "review" "destructive"])
-          :required_scope (:anyOf [(:type "string") (:type "null")])
-          :prompt (:type "string" :maxLength ,madrigal-do--suggestion-prompt-limit))
-         :required ["relevance" "confidence" "impact" "reversibility" "required_scope" "prompt"] :additionalProperties :false)])))
+          :action-description
+          (:type "string" :minLength 1
+           :description "An Org mode description of the action.")
+          :action-source (:type "string" :minLength 1))
+         :required ["relevance" "action-description" "action-source"]
+         :additionalProperties :false)])))
     :required ["suggestions"] :additionalProperties :false)
   "JSON schema for ranked immediate actions and Madrigal prompts.")
 
@@ -630,13 +606,13 @@ When KEEP-INDICATOR is non-nil, transfer its indicator to a selected action."
       (list :kind 'echo
             :content
             (madrigal-do--brief-summary
-             (madrigal-do--suggestion-string object :echo 240))))
+             (madrigal-do--suggestion-string object :echo))))
      ((plist-member object :document)
       (madrigal-do--require-json-keys object '(:document) "action result")
       (let ((document (plist-get object :document)))
         (madrigal-do--require-json-keys
          document '(:name :content) "action document")
-        (let ((name (madrigal-do--suggestion-string document :name 80))
+        (let ((name (madrigal-do--suggestion-string document :name))
               (content (plist-get document :content)))
           (when (string-match-p "[\n\r]" name)
             (error "Invalid Madrigal action document name"))
@@ -1030,12 +1006,11 @@ CONTEXT is nil, read the instruction after selecting the target SCOPE."
                               (string< (symbol-name left) (symbol-name right))))))
     (error "Invalid Madrigal %s fields" description)))
 
-(defun madrigal-do--suggestion-string (entry key limit)
-  "Return trimmed string KEY from ENTRY, bounded by LIMIT."
+(defun madrigal-do--suggestion-string (entry key)
+  "Return the trimmed non-empty string KEY from ENTRY."
   (let ((value (plist-get entry key)))
     (unless (and (stringp value)
-                 (not (string-empty-p (string-trim value)))
-                 (<= (length value) limit))
+                 (not (string-empty-p (string-trim value))))
       (error "Invalid Madrigal suggestion field %s" key))
     (string-trim value)))
 
@@ -1049,55 +1024,37 @@ CONTEXT is nil, read the instruction after selecting the target SCOPE."
     (list :name "eval"
           :arguments
           (list :source
-                (madrigal-do--suggestion-string
-                 arguments :source madrigal-do--direct-source-limit)))))
+                (madrigal-do--suggestion-string arguments :source)))))
 
 (defun madrigal-do--parse-suggestion (entry)
   "Validate one action or prompt suggestion ENTRY."
-  (let* ((relevance (plist-get entry :relevance))
-         (confidence (or (plist-get entry :confidence) relevance))
-         (impact (or (plist-get entry :impact) "local"))
-         (reversibility (or (plist-get entry :reversibility) "reversible"))
-         (required-scope (plist-get entry :required_scope))
-         (alternative (cond ((plist-member entry :action) :action)
-                            ((plist-member entry :prompt) :prompt)))
-         (optional (seq-filter (lambda (key) (plist-member entry key))
-                               '(:confidence :impact :reversibility
-                                 :required_scope))))
-    (unless alternative
-      (error "Invalid Madrigal suggestion alternative"))
-    (madrigal-do--require-json-keys
-     entry (append (list :relevance alternative) optional) "suggestion")
-    (unless (and (numberp relevance) (<= 0 relevance) (<= relevance 1)
-                 (numberp confidence) (<= 0 confidence) (<= confidence 1)
-                 (member impact '("local" "buffer" "project" "session"))
-                 (member reversibility '("reversible" "review" "destructive")))
-      (error "Invalid Madrigal suggestion metadata"))
-    (let ((arguments (list :relevance relevance :confidence confidence
-                           :impact impact :reversibility reversibility
-                           :required-scope required-scope)))
-      (cond
-       ((plist-member entry :action)
-        (let ((action (plist-get entry :action)))
-          (madrigal-do--require-json-keys
-           action '(:description :tool_call) "action")
-          (apply #'madrigal-action-suggestion-create
-                 (append arguments
-                         (list :action
-                               (list :description
-                                     (madrigal-do--suggestion-string
-                                      action :description
-                                      madrigal-do--suggestion-description-limit)
-                                     :tool-call
-                                     (madrigal-do--validate-direct-tool-call
-                                      (plist-get action :tool_call))))))))
-       ((plist-member entry :prompt)
-        (apply #'madrigal-action-suggestion-create
-               (append arguments
-                       (list :prompt
-                             (madrigal-do--suggestion-string
-                              entry :prompt madrigal-do--suggestion-prompt-limit)))))
-       (t (error "Invalid Madrigal suggestion alternative"))))))
+  (let ((relevance (plist-get entry :relevance)))
+    (unless (and (numberp relevance) (<= 0 relevance) (<= relevance 1))
+      (error "Invalid Madrigal suggestion relevance"))
+    (cond
+     ((plist-member entry :do-prompt)
+      (madrigal-do--require-json-keys
+       entry '(:relevance :do-prompt) "prompt suggestion")
+      (madrigal-action-suggestion-create
+       :relevance relevance
+       :prompt (madrigal-do--suggestion-string entry :do-prompt)))
+     ((or (plist-member entry :action-description)
+          (plist-member entry :action-source))
+      (madrigal-do--require-json-keys
+       entry '(:relevance :action-description :action-source)
+       "action suggestion")
+      (madrigal-action-suggestion-create
+       :relevance relevance
+       :action
+       (list
+        :description
+        (madrigal-do--suggestion-string entry :action-description)
+        :tool-call
+        (list :name "eval"
+              :arguments
+              (list :source
+                    (madrigal-do--suggestion-string entry :action-source))))))
+     (t (error "Invalid Madrigal suggestion alternative")))))
 
 (defun madrigal-do--parse-suggestions (text)
   "Parse TEXT, discarding malformed candidates independently."
@@ -1109,8 +1066,7 @@ CONTEXT is nil, read the instruction after selecting the target SCOPE."
          (seen (make-hash-table :test #'equal))
          suggestions diagnostics)
     (madrigal-do--require-json-keys object '(:suggestions) "response")
-    (unless (and (listp entries)
-                 (<= (length entries) madrigal-do--suggestion-max-count))
+    (unless (listp entries)
       (error "Invalid Madrigal suggestions array"))
     (cl-loop for entry in entries for index from 0 do
              (condition-case err
@@ -1141,7 +1097,8 @@ CONTEXT is nil, read the instruction after selecting the target SCOPE."
 
 (defun madrigal-do--suggestion-action-p (suggestion)
   "Return non-nil when SUGGESTION is an immediate action."
-  (not (null (madrigal-action-suggestion-action suggestion))))
+  (and (null (madrigal-action-suggestion-prompt suggestion))
+       (madrigal-action-suggestion-action suggestion)))
 
 (defun madrigal-do--relevance-indicator (relevance)
   "Return a pie-circle indicator for RELEVANCE."
@@ -1168,13 +1125,7 @@ CONTEXT is nil, read the instruction after selecting the target SCOPE."
   "Return SUGGESTION in its completion display format."
   (concat (madrigal-do--suggestion-prefix suggestion)
           (madrigal-do--org-fontify-string
-           (madrigal-do--suggestion-label suggestion))
-          (format "  [confidence %.0f%%; %s; %s]"
-                  (* 100 (or (madrigal-action-suggestion-confidence suggestion)
-                             (madrigal-action-suggestion-relevance suggestion)))
-                  (or (madrigal-action-suggestion-impact suggestion) "local")
-                  (or (madrigal-action-suggestion-reversibility suggestion)
-                      "reversible"))))
+           (madrigal-do--suggestion-label suggestion))))
 
 (defun madrigal-do--suggestion-completion-table (candidates)
   "Return a categorized completion table for DWIM CANDIDATES."
@@ -1188,21 +1139,10 @@ CONTEXT is nil, read the instruction after selecting the target SCOPE."
            . ,(lambda (labels)
                 (mapcar
                  (lambda (label)
-                   (let ((suggestion (cdr (assoc label candidates))))
+                   (let ((suggestion (cdr (assoc-string label candidates))))
                      (list label
                            (madrigal-do--suggestion-prefix suggestion)
-                           (format "  [confidence %.0f%%; %s; %s]"
-                                   (* 100 (or
-                                           (madrigal-action-suggestion-confidence
-                                            suggestion)
-                                           (madrigal-action-suggestion-relevance
-                                            suggestion)))
-                                   (or (madrigal-action-suggestion-impact suggestion)
-                                       "local")
-                                   (or
-                                    (madrigal-action-suggestion-reversibility
-                                     suggestion)
-                                    "reversible")))))
+                           "")))
                  labels))))
       (complete-with-action action (mapcar #'car candidates) string pred))))
 
@@ -1283,8 +1223,10 @@ CONTEXT is nil, read the instruction after selecting the target SCOPE."
        (list :instructions
              (list instructions
                    "Return a small set ordered by decreasing relevance."
-                   "For each suggestion estimate confidence, impact, reversibility, and any broader required_scope."
-                   "Use action for one independently executable eval operation; use prompt for a Madrigal question, investigation, explanation, or plan."
+                   "For each suggestion estimate relevance from zero to one."
+                   "Use do-prompt for a Madrigal question, investigation, explanation, or plan."
+                   "Use action-description and action-source for one independently executable eval operation."
+                   "The action-description field MUST use Org mode formatting; use Org markup when it improves readability."
                    "Do not perform an action or emit tool calls. Return only the requested structured response.")
              :context planning-context))))))
 
@@ -1395,22 +1337,6 @@ RENDERED-CONTEXT, when non-nil, is the prepared suggestion context."
 
 (defun madrigal-do--dispatch-suggestion (context selection indicator)
   "Dispatch SELECTION against CONTEXT, transferring INDICATOR when needed."
-  (when (and (madrigal-action-suggestion-p selection)
-             (madrigal-action-suggestion-required-scope selection)
-             (not (equal (madrigal-action-suggestion-required-scope selection)
-                         (plist-get (plist-get context :scope) :label))))
-    (madrigal-do--delete-request-indicator indicator)
-    (user-error "Suggestion requires scope %s; rerun with a prefix argument"
-                (madrigal-action-suggestion-required-scope selection)))
-  (when (and (madrigal-action-suggestion-p selection)
-             (madrigal-do--suggestion-action-p selection)
-             (or (member (madrigal-action-suggestion-impact selection)
-                         '("project" "session"))
-                 (member (madrigal-action-suggestion-reversibility selection)
-                         '("review" "destructive")))
-             (not (yes-or-no-p "Review this broad or risky Madrigal action? ")))
-    (madrigal-do--delete-request-indicator indicator)
-    (user-error "Madrigal action cancelled"))
   (cond
    ((stringp selection)
     (madrigal-do--execute context selection 'dwim indicator))

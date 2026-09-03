@@ -2043,7 +2043,7 @@
 (ert-deftest madrigal-do-parses-and-sorts-action-and-prompt-suggestions ()
   (let ((suggestions
          (madrigal-do--parse-suggestions
-          "{\"suggestions\":[{\"relevance\":0.7,\"prompt\":\"Explain the symbol at point.\"},{\"relevance\":0.9,\"action\":{\"description\":\"Run the test\",\"tool_call\":{\"name\":\"eval\",\"arguments\":{\"source\":\"(ert-run-test-at-point)\"}}}}]}")))
+          "{\"suggestions\":[{\"relevance\":0.7,\"do-prompt\":\"Explain the symbol at point.\"},{\"relevance\":0.9,\"action-description\":\"Run the test\",\"action-source\":\"(ert-run-test-at-point)\"}]}")))
     (should (= 2 (length suggestions)))
     (should (madrigal-do--suggestion-action-p (car suggestions)))
     (should (equal "Run the test"
@@ -2067,28 +2067,141 @@
 (ert-deftest madrigal-do-discards-invalid-suggestions-independently ()
   (let ((suggestions
          (madrigal-do--parse-suggestions
-          "{\"suggestions\":[{\"relevance\":1.1,\"prompt\":\"Act\"},{\"relevance\":0.5,\"prompt\":\"Explain this.\"}]}")))
+          "{\"suggestions\":[{\"relevance\":1.1,\"do-prompt\":\"Act\"},{\"relevance\":0.5,\"do-prompt\":\"Explain this.\"}]}")))
     (should (= 1 (length suggestions)))
     (should (= 1 (length madrigal-do--last-suggestion-diagnostics)))))
 
-(ert-deftest madrigal-do-suggestion-schema-is-a-bounded-sum-of-products ()
+(ert-deftest madrigal-do-suggestion-schema-is-an-unbounded-sum-of-products ()
   (let* ((properties (plist-get madrigal-do--suggestion-response-schema
                                 :properties))
          (array (plist-get properties :suggestions))
-         (alternatives (plist-get (plist-get array :items) :anyOf)))
+         (alternatives (append (plist-get (plist-get array :items) :anyOf)
+                               nil)))
     (should (equal '(:suggestions) (madrigal-do--plist-keys properties)))
-    (should (= 8 (plist-get array :maxItems)))
-    (should (= 2 (length alternatives)))))
+    (should-not (plist-member array :maxItems))
+    (should (= 2 (length alternatives)))
+    (dolist (alternative alternatives)
+      (dolist (field '(:do-prompt :action-description :action-source))
+        (when-let* ((property
+                     (plist-get (plist-get alternative :properties) field)))
+          (should-not (plist-member property :maxLength)))))))
 
-(ert-deftest madrigal-do-rejects-oversized-suggestion-arrays ()
+(ert-deftest madrigal-do-response-schemas-have-no-string-length-limits ()
+  (let* ((result (plist-get madrigal-do--action-response-schema :properties))
+         (alternatives
+          (append
+           (plist-get (plist-get result :result) :anyOf) nil)))
+    (dolist (alternative alternatives)
+      (cl-labels ((has-max-length-p
+                   (value)
+                   (cond
+                    ((consp value)
+                     (or (eq (car value) :maxLength)
+                         (seq-some #'has-max-length-p value)))
+                    ((vectorp value) (seq-some #'has-max-length-p value)))))
+        (should-not (has-max-length-p alternative))))))
+
+(ert-deftest madrigal-do-response-schemas-describe-org-mode-fields ()
+  (let* ((action-alternatives
+          (append
+           (plist-get
+            (plist-get (plist-get madrigal-do--action-response-schema :properties)
+                       :result)
+            :anyOf)
+           nil))
+         (document-properties
+          (plist-get
+           (plist-get (plist-get (cadr action-alternatives) :properties)
+                      :document)
+           :properties))
+         (suggestion-items
+          (plist-get
+           (plist-get
+            (plist-get madrigal-do--suggestion-response-schema :properties)
+            :suggestions)
+           :items))
+         (suggestion-alternatives
+          (append (plist-get suggestion-items :anyOf) nil)))
+    (should (equal "An Org mode document body."
+                   (plist-get (plist-get document-properties :content)
+                              :description)))
+    (should (equal "An Org mode description of the action."
+                   (plist-get
+                    (plist-get (plist-get (cadr suggestion-alternatives) :properties)
+                               :action-description)
+                    :description)))))
+
+(ert-deftest madrigal-do-accepts-unbounded-prompt-and-source-suggestions ()
+  (let* ((prompt (make-string 501 ?p))
+         (source (make-string 16001 ?s))
+         (suggestions
+          (madrigal-do--parse-suggestions
+           (json-serialize
+            `(:suggestions
+              [(:relevance 0.5 :do-prompt ,prompt)
+               (:relevance 0.5 :action-description "Run it"
+                :action-source ,source)])))))
+    (let ((prompt-suggestion
+           (seq-find (lambda (suggestion)
+                       (madrigal-action-suggestion-prompt suggestion))
+                     suggestions))
+          (action-suggestion
+           (seq-find #'madrigal-do--suggestion-action-p suggestions)))
+      (should (equal prompt
+                     (madrigal-action-suggestion-prompt prompt-suggestion)))
+      (should (equal source
+                     (plist-get
+                      (plist-get
+                       (plist-get (madrigal-action-suggestion-action action-suggestion)
+                                  :tool-call)
+                       :arguments)
+                      :source))))))
+
+(ert-deftest madrigal-do-completion-keeps-multiline-prompts-and-omits-source ()
+  (let* ((prompt "Explain this.\nInclude an example.")
+         (source "(message \"never display this\")")
+         (suggestions
+          (madrigal-do--parse-suggestions
+           (json-serialize
+            `(:suggestions
+              [(:relevance 0.9 :do-prompt ,prompt)
+               (:relevance 0.8 :action-description "Run tests"
+                :action-source ,source)]))))
+         (candidates (mapcar (lambda (suggestion)
+                               (cons (madrigal-do--suggestion-label suggestion)
+                                     suggestion))
+                             suggestions))
+         (completions
+          (all-completions ""
+                           (madrigal-do--suggestion-completion-table candidates))))
+    (should (member prompt completions))
+    (should-not (seq-some (lambda (completion) (string-match-p source completion))
+                          completions))))
+
+(ert-deftest madrigal-do-completion-affixes-match-suggestion-kinds ()
+  (let* ((prompt (madrigal-action-suggestion-create
+                  :relevance 0.5 :prompt "Explain this"))
+         (action (madrigal-action-suggestion-create
+                  :relevance 0.5
+                  :action '(:description "Run tests" :tool-call (:name "eval"))))
+         (candidates `(("Explain this" . ,prompt) ("Run tests" . ,action)))
+         (table (madrigal-do--suggestion-completion-table candidates))
+         (metadata (funcall table "" nil 'metadata))
+         (affixation (cdr (assq 'affixation-function (cdr metadata))))
+         (affixes (funcall affixation '("Explain this" "Run tests"))))
+    (should (string-match-p "🧠" (nth 1 (car affixes))))
+    (should (string-match-p "⚡" (nth 1 (cadr affixes))))))
+
+(ert-deftest madrigal-do-accepts-more-than-eight-suggestions ()
   (let ((entries
          (mapconcat
           (lambda (index)
-            (format "{\"relevance\":0.5,\"prompt\":\"Explain item %d.\"}" index))
+            (format "{\"relevance\":0.5,\"do-prompt\":\"Explain item %d.\"}" index))
           (number-sequence 1 9) ",")))
-    (should-error
-     (madrigal-do--parse-suggestions
-      (format "{\"suggestions\":[%s]}" entries)))))
+    (should (= 9
+               (length
+                (madrigal-do--parse-suggestions
+                 (format "{\"suggestions\":[%s]}" entries)))))))
 
 
 
@@ -2117,7 +2230,7 @@
         (should (overlay-buffer (car indicator)))
         (condition-case nil
             (funcall success
-                     "{\"suggestions\":[{\"relevance\":1,\"prompt\":\"Act\"}]}")
+                     "{\"suggestions\":[{\"relevance\":1,\"do-prompt\":\"Act\"}]}")
           (quit nil))
         (should (eq 'cancelled
                     (madrigal-dwim-suggestion-request-status request)))
@@ -2144,7 +2257,7 @@
 (ert-deftest madrigal-do-discards-malformed-invocations-and-duplicate-labels ()
   (let ((suggestions
          (madrigal-do--parse-suggestions
-          "{\"suggestions\":[{\"relevance\":1,\"action\":{\"description\":\"Change\",\"tool_call\":{\"name\":\"shell\",\"arguments\":{\"source\":\"echo no\"}}}},{\"relevance\":0.8,\"prompt\":\"Explain this.\"},{\"relevance\":0.7,\"prompt\":\"Explain this.\"}]}")))
+          "{\"suggestions\":[{\"relevance\":1,\"action-description\":\"Change\"},{\"relevance\":0.8,\"do-prompt\":\"Explain this.\"},{\"relevance\":0.7,\"do-prompt\":\"Explain this.\"}]}")))
     (should (= 1 (length suggestions)))
     (should (= 2 (length madrigal-do--last-suggestion-diagnostics)))))
 
@@ -2297,6 +2410,11 @@
            ("do-dwim" . ("Provider" . "fast-model")))))
     (should (equal "do-dwim" (madrigal-do--dwim-model-agent)))))
 
+(ert-deftest madrigal-do-system-prompt-requires-org-document-content ()
+  (should (string-match-p
+           (regexp-quote "document content field MUST use Org mode formatting")
+           madrigal--do-system-prompt)))
+
 (ert-deftest madrigal-do-suggestion-prompt-always-requests-json-schema ()
   (with-temp-buffer
     (let ((default-directory temporary-file-directory))
@@ -2308,7 +2426,10 @@
           (should-not (llm-chat-prompt-temperature prompt))
           (should (eq 'none (llm-chat-prompt-reasoning prompt)))
           (should (string-match-p
-                   (regexp-quote "Use action for one independently executable eval operation")
+                   (regexp-quote "Use action-description and action-source")
+                   (llm-chat-prompt-context prompt)))
+          (should (string-match-p
+                   (regexp-quote "action-description field MUST use Org mode formatting")
                    (llm-chat-prompt-context prompt)))
           (should (string-match-p
                    (regexp-quote "Do not perform an action or emit tool calls")
@@ -2545,14 +2666,13 @@
                     '(project session))
           (should (= 0.0 (madrigal-context-candidate-score candidate))))))))
 
-(ert-deftest madrigal-dwim-suggestion-displays-review-metadata ()
+(ert-deftest madrigal-dwim-suggestion-display-uses-relevance-and-kind ()
   (let* ((suggestion
           (madrigal-action-suggestion-create
-           :relevance 0.9 :confidence 0.8 :impact "project"
-           :reversibility "review" :prompt "Inspect it"))
+           :relevance 0.9 :prompt "Inspect it"))
          (display (madrigal-do--suggestion-display suggestion)))
-    (should (string-match-p "confidence 80%" display))
-    (should (string-match-p "project; review" display))))
+    (should (string-match-p "🧠" display))
+    (should (string-match-p "Inspect it" display))))
 
 (ert-deftest madrigal-context-completion-uses-request-preview-face ()
   (with-temp-buffer
@@ -2916,7 +3036,7 @@
                       (madrigal-context-candidate-label candidate)))
                    candidates)))))))
 
-(ert-deftest madrigal-dwim-schema-requires-nullable-scope-metadata ()
+(ert-deftest madrigal-dwim-schema-has-only-requested-product-fields ()
   (let* ((suggestions
           (plist-get (plist-get madrigal-do--suggestion-response-schema
                                 :properties)
@@ -2924,14 +3044,11 @@
          (alternatives (append (plist-get (plist-get suggestions :items)
                                           :anyOf)
                                nil)))
-    (dolist (alternative alternatives)
-      (should (seq-contains-p (plist-get alternative :required)
-                              "required_scope" #'equal))
-      (should (equal [(:type "string") (:type "null")]
-                     (plist-get
-                      (plist-get
-                       (plist-get alternative :properties)
-                       :required_scope)
-                      :anyOf))))))
+    (should (equal '(:relevance :do-prompt)
+                   (madrigal-do--plist-keys
+                    (plist-get (car alternatives) :properties))))
+    (should (equal '(:relevance :action-description :action-source)
+                   (madrigal-do--plist-keys
+                    (plist-get (cadr alternatives) :properties))))))
 
 ;;; madrigal-test.el ends here
