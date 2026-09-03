@@ -111,7 +111,7 @@
   (with-temp-buffer
     (let ((madrigal-providers '(("Provider" :provider fake-provider)))
           (madrigal-agent-models '(("assistant" . ("Provider" . "model"))))
-          (madrigal-agents '(("assistant" :system-prompt "System" :tools ("eval"))))
+          (madrigal--agents '(("assistant" :system-prompt "System" :tools ("eval"))))
           captured-provider
           captured-prompt
           started)
@@ -138,8 +138,33 @@
                                  (llm-chat-prompt-tools captured-prompt))))
           (should (plist-get started :request-id)))))))
 
+(ert-deftest madrigal-agent-controller-extracts-multi-output-reasoning ()
+  (should (equal "Consider the buffer first."
+                 (madrigal-agent-controller--response-reasoning
+                  '(:text "Done" :reasoning "Consider the buffer first."))))
+  (should-not (madrigal-agent-controller--response-reasoning "Done")))
+
+(ert-deftest madrigal-agent-controller-notifies-tool-only-responses ()
+  (skip-unless (madrigal-llm-available-p))
+  (let ((madrigal-providers '(("Provider" :provider fake-provider)))
+        (madrigal-agent-models '(("assistant" . ("Provider" . "model"))))
+        (madrigal--agents '(("assistant" :system-prompt "System" :tools nil)))
+        event)
+    (cl-letf (((symbol-function 'llm-chat-async)
+               (lambda (_provider _prompt response-callback _error &optional _multi)
+                 (funcall response-callback
+                          '(:tool-uses ((:name "eval" :args nil))))
+                 'request))
+              ((symbol-function 'run-at-time) (lambda (&rest _) nil)))
+      (madrigal-agent-controller-submit-async
+       :agent "assistant" :history '((:role user :content "Act"))
+       :on-response (lambda (value) (setq event value))))
+    (should event)
+    (should-not (plist-get event :text))
+    (should-not (plist-get event :final))))
+
 (ert-deftest madrigal-agent-controller-context-size-reports-limit-and-percent ()
-  (let ((madrigal-agents '(("assistant" :system-prompt "System" :tools nil))))
+  (let ((madrigal--agents '(("assistant" :system-prompt "System" :tools nil))))
     (cl-letf (((symbol-function 'llm-count-tokens)
                (lambda (_provider text) (length text)))
               ((symbol-function 'llm-chat-token-limit)
@@ -1353,6 +1378,12 @@
     (should (string-match-p "\\*\\*\\* Response" (buffer-string)))
     (should (string-match-p "\\*\\*\\*\\* Detail" (buffer-string)))))
 
+(ert-deftest madrigal-append-assistant-text-omits-blank-notes ()
+  (with-temp-buffer
+    (org-mode)
+    (madrigal--append-assistant-text "req-blank" " \n\t")
+    (should-not (string-match-p "\\*\\* Note" (buffer-string)))))
+
 (ert-deftest madrigal-append-assistant-text-aligns-org-tables ()
   (with-temp-buffer
     (org-mode)
@@ -1823,10 +1854,16 @@
                 ((symbol-function 'madrigal-agent-controller-submit-async)
                  (lambda (&rest args)
                    (funcall (plist-get args :on-start) '(:model "model"))
+                   (let ((sink (plist-get (plist-get args :environment) :event-sink)))
+                     (funcall sink '(:phase started :id "tool-1" :name "eval"
+                                     :source "(buffer-name)"))
+                     (funcall sink '(:phase finished :id "tool-1" :name "eval"
+                                     :source "(buffer-name)" :result "buffer")))
+                   (funcall (plist-get args :on-response) '(:final nil))
                    (funcall (plist-get args :on-response)
-                            '(:text "I will inspect first." :final nil))
-                   (funcall (plist-get args :on-response)
-                            '(:text "Updated the buffer." :final t))
+                            '(:text "```org\n* Updated\nThe buffer is current.\n```"
+                              :reasoning "Checked the selected buffer."
+                              :final t))
                    (funcall (plist-get args :on-finished) nil)
                    (should-not (plist-member args :response-format))
                    (madrigal-agent-controller-handle-create
@@ -1834,9 +1871,18 @@
         (let ((action (madrigal-do
                        "Update it"
                        (madrigal-context (current-buffer)))))
-          (should (equal "Updated the buffer."
+          (should (equal "* Updated\nThe buffer is current."
                          (madrigal-action-response action)))
           (should (= 3 (length (madrigal-action-turns action))))
+          (should (equal "Checked the selected buffer."
+                         (madrigal-action-turn-reasoning
+                          (nth 2 (madrigal-action-turns action)))))
+          (should (equal '("tool-1")
+                         (mapcar #'madrigal-tool-event-id
+                                 (madrigal-action-turn-tool-events
+                                  (nth 1 (madrigal-action-turns action))))))
+          (should-not (madrigal-action-turn-tool-events
+                       (nth 2 (madrigal-action-turns action))))
           (should (equal 'intermediate
                          (madrigal-action-turn-kind
                           (nth 1 (madrigal-action-turns action)))))
@@ -1882,6 +1928,14 @@
           (should (equal "#+title: Result\n\n* Details\nComplete"
                          (buffer-string))))
       (kill-buffer displayed))))
+
+(ert-deftest madrigal-do-promotes-a-fully-fenced-org-response ()
+  (should (equal "#+title: Result\n\n* Details\nComplete"
+                 (madrigal-do--promote-org-response
+                  "```org\n#+title: Result\n\n* Details\nComplete\n```\n")))
+  (should (equal "Text before\n```org\n* Details\n```"
+                 (madrigal-do--promote-org-response
+                  "Text before\n```org\n* Details\n```"))))
 
 (ert-deftest madrigal-do-response-title-prefers-title-heading-then-prompt ()
   (should (equal "Named report"
@@ -1936,12 +1990,30 @@
     (should (string-match-p "finished" annotation))
     (should (get-text-property 0 'face candidate))))
 
+(ert-deftest madrigal-do-history-reads-system-context-from-prompt-interactions ()
+  (let ((prompt (llm-make-chat-prompt "Inspect" :context "System instructions")))
+    (cl-letf (((symbol-function 'llm-chat-prompt-context) (lambda (_) nil)))
+      (should (equal "System instructions"
+                     (madrigal-do--prompt-system-context prompt))))))
+
 (ert-deftest madrigal-do-history-renders-turns-and-tools-in-read-only-org-buffer ()
-  (let* ((action
+  (let* ((prompt (llm-make-chat-prompt
+                  "Inspect this"
+                  :context
+                  "* Instructions\nSystem instructions\n* Context\n#+begin_src emacs-lisp\n'(:text \"Selected context\")\n#+end_src"))
+         (action
           (madrigal-action-create
            :id "history-1" :instruction "Inspect this"
+           :handle (madrigal-agent-controller-handle-create :prompt prompt)
            :turns (list (madrigal-action-turn-create
                          :role 'user :text "Inspect this")
+                        (madrigal-action-turn-create
+                         :role 'assistant :kind 'intermediate
+                         :reasoning "Check the live value."
+                         :tool-events (list (madrigal-tool-event-create
+                                             :name "eval" :language "emacs-lisp"
+                                             :source "(+ 1 1)"
+                                             :result '(:ok t :value 2))))
                         (madrigal-action-turn-create
                          :role 'assistant :kind 'summary :final t :text "Done."))
            :tool-events (list (madrigal-tool-event-create
@@ -1958,12 +2030,30 @@
             (should (eq (key-binding (kbd "q")) #'quit-window))
             (should (eq (key-binding (kbd "g"))
                         #'madrigal-do--refresh-history-buffer))
+            (should (string-match-p
+                     (regexp-quote
+                      "* System prompt\n** Instructions\nSystem instructions\n** Context\n#+begin_src emacs-lisp")
+                     (buffer-string)))
+            (should-not (string-match-p "System prompt and model context"
+                                        (buffer-string)))
             (should (string-match-p (regexp-quote "* User\nInspect this")
                                     (buffer-string)))
+            (should (string-match-p
+                     (regexp-quote "** Reasoning\nCheck the live value.")
+                     (buffer-string)))
+            (should-not (string-match-p (regexp-quote "** Note")
+                                        (buffer-string)))
             (should (string-match-p (regexp-quote "** Response\nDone.")
                                     (buffer-string)))
             (should (string-match-p (regexp-quote "** Tools\n*** eval")
                                     (buffer-string)))
+            (let ((reasoning-position
+                   (string-match (regexp-quote "** Reasoning") (buffer-string)))
+                  (tool-position
+                   (string-match (regexp-quote "** Tools") (buffer-string)))
+                  (response-position
+                   (string-match (regexp-quote "** Response") (buffer-string))))
+              (should (< reasoning-position tool-position response-position)))
             (should (string-match-p (regexp-quote "(+ 1 1)")
                                     (buffer-string)))
             (should (string-match-p (regexp-quote ":value 2")
@@ -1994,9 +2084,12 @@
         (kill-buffer buffer)))))
 
 (ert-deftest madrigal-do-dwim-history-binds-refresh ()
-  (let* ((request (madrigal-dwim-suggestion-request-create
+  (let* ((prompt (llm-make-chat-prompt
+                  "Suggest"
+                  :context "* Instructions and context\nDWIM system instructions"))
+         (request (madrigal-dwim-suggestion-request-create
                    :id "dwim-refresh-1" :context '(:scope (:target session))
-                   :response "response"))
+                   :prompt prompt :response "response"))
          buffer)
     (unwind-protect
         (cl-letf (((symbol-function 'display-buffer)
@@ -2004,7 +2097,9 @@
           (madrigal-do--render-dwim-history request)
           (with-current-buffer buffer
             (should (eq (key-binding (kbd "g"))
-                        #'madrigal-do--refresh-history-buffer))))
+                        #'madrigal-do--refresh-history-buffer))
+            (should (string-match-p "DWIM system instructions"
+                                    (buffer-string)))))
       (when (buffer-live-p buffer)
         (kill-buffer buffer)))))
 
@@ -2379,15 +2474,15 @@
                    'provider 'prompt 'success 'error)))
       (should (equal '(provider prompt success error t) submitted)))))
 
-(ert-deftest madrigal-do-agent-definition-survives-custom-agent-lists ()
-  (let ((madrigal-agents '(("assistant" :system-prompt "Custom" :tools nil))))
-    (should (equal '("eval" "persist-elisp")
-                   (plist-get (madrigal--agent-definition "do") :tools)))
-    (should (equal madrigal--do-system-prompt
-                   (plist-get (madrigal--agent-definition "do") :system-prompt)))
-    (should (equal '("do" "do-dwim")
-                   (seq-filter (lambda (name) (member name '("do" "do-dwim")))
-                               (madrigal--selectable-agent-names))))))
+(ert-deftest madrigal-agent-definitions-are-internal ()
+  (should-not (custom-variable-p 'madrigal--agents))
+  (should (equal '("eval" "persist-elisp")
+                 (plist-get (madrigal--agent-definition "do") :tools)))
+  (should (equal madrigal--do-system-prompt
+                 (plist-get (madrigal--agent-definition "do") :system-prompt)))
+  (should (equal '("do" "do-dwim")
+                 (seq-filter (lambda (name) (member name '("do" "do-dwim")))
+                             (madrigal--selectable-agent-names)))))
 
 (ert-deftest madrigal-default-assistant-can-persist-reusable-elisp ()
   (let ((definition (madrigal--agent-definition "assistant")))
@@ -2414,9 +2509,9 @@
            ("do-dwim" . ("Provider" . "fast-model")))))
     (should (equal "do-dwim" (madrigal-do--dwim-model-agent)))))
 
-(ert-deftest madrigal-do-system-prompt-requires-a-raw-org-response ()
+(ert-deftest madrigal-do-system-prompt-requires-an-org-response ()
   (should (string-match-p
-           (regexp-quote "return only the raw Org mode body")
+           (regexp-quote "When finished, return your response as org-mode formatted text.")
            madrigal--do-system-prompt))
   (should (string-match-p
            (regexp-quote "Emacs chooses and names any response buffer")
@@ -2436,7 +2531,7 @@
                    (regexp-quote "Use action-description and action-source")
                    (llm-chat-prompt-context prompt)))
           (should (string-match-p
-                   (regexp-quote "action-description field MUST use Org mode formatting")
+                   (regexp-quote "Return action-description as org-mode formatted text.")
                    (llm-chat-prompt-context prompt)))
           (should (string-match-p
                    (regexp-quote "Do not perform an action or emit tool calls")
@@ -2648,6 +2743,15 @@
           (should-not (plist-member context :origin))
           (should-not (string-match-p "private document"
                                       (madrigal-context-render context))))))))
+
+(ert-deftest madrigal-context-render-uses-an-org-elisp-block ()
+  (with-temp-buffer
+    (insert "selected text")
+    (let ((rendered (madrigal-context-render (madrigal-context (current-buffer)))))
+      (should (string-prefix-p "* Context\n" rendered))
+      (should (string-match-p (regexp-quote "#+begin_src emacs-lisp\n'(")
+                              rendered))
+      (should (string-suffix-p "#+end_src" rendered)))))
 
 (ert-deftest madrigal-context-selects-project-scope-without-prompting ()
   (with-temp-buffer
@@ -2978,6 +3082,8 @@
                       candidates)))
         (should mail)
         (should thread)
+        (should (> (madrigal-context-candidate-score thread)
+                   (madrigal-context-candidate-score mail)))
         (should (< (madrigal-context-candidate-size mail)
                    (madrigal-context-candidate-size thread)))))))
 

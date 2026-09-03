@@ -65,6 +65,12 @@
     (plist-get response :text))
    (t nil)))
 
+(defun madrigal-agent-controller--response-reasoning (response)
+  "Extract reasoning text from RESPONSE, or nil when absent."
+  (and (listp response)
+       (stringp (plist-get response :reasoning))
+       (plist-get response :reasoning)))
+
 (defun madrigal-agent-controller--response-has-tool-uses-p (response)
   "Return non-nil when RESPONSE includes tool calls to continue from."
   (and (listp response)
@@ -203,13 +209,16 @@
          (success-callback
           (lambda (response)
             (let ((text (madrigal-agent-controller--response-text response))
+                  (reasoning
+                   (madrigal-agent-controller--response-reasoning response))
                   (continuep (madrigal-agent-controller--response-has-tool-uses-p response)))
-              (when text
+              (when (or text reasoning continuep)
                 (madrigal-agent-controller--notify
                  handle :response
                  (list :request-id request-id
                        :agent (madrigal-agent-controller-handle-agent handle)
                        :text text
+                       :reasoning reasoning
                        :final (not continuep)
                        :raw response)))
               (if continuep

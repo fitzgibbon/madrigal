@@ -547,13 +547,6 @@ When nil, allow any language enabled in `org-babel-load-languages'."
         :function madrigal--run-babel-tool
         :async t))
 
-(setf (alist-get "babel-assistant" madrigal-agents nil nil #'string=)
-      '(:system-prompt
-        "Reply in Org mode only.
-Do NOT invoke python or other babel languages from a shell script.
-Final natural-language responses must begin with a top-level Org heading whose title summarizes the completed turn."
-        :tools ("babel")))
-
 (provide 'madrigal-tool-babel)
 
 ;;; madrigal-tool-babel.el ends here
