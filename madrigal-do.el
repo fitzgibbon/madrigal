@@ -79,8 +79,6 @@ that accent over the default background at separate context and point strengths.
   status
   turns
   tool-events
-  response-kind
-  response-name
   response
   error
   started-at
@@ -447,26 +445,6 @@ Mouse-1 visits CONTEXT.  Mouse-3 calls CANCEL-FUNCTION."
       (when (and (markerp marker) (marker-buffer marker))
         (goto-char marker)))))
 
-(defconst madrigal-do--action-response-schema
-  '(:type "object"
-    :properties
-    (:result
-     (:anyOf
-      [(:type "object" :properties
-        (:echo (:type "string" :minLength 1))
-        :required ["echo"] :additionalProperties :false)
-       (:type "object" :properties
-        (:document
-         (:type "object" :properties
-          (:name (:type "string" :minLength 1)
-           :content
-           (:type "string" :minLength 1
-            :description "An Org mode document body."))
-          :required ["name" "content"] :additionalProperties :false))
-        :required ["document"] :additionalProperties :false)]))
-    :required ["result"] :additionalProperties :false)
-  "Structured final response for a Madrigal action.")
-
 (defconst madrigal-do--suggestion-response-schema
   `(:type "object"
     :properties
@@ -591,42 +569,23 @@ When KEEP-INDICATOR is non-nil, transfer its indicator to a selected action."
      ((or (zerop limit) (<= (length summary) limit)) summary)
      (t (concat (substring summary 0 (max 0 (- limit 1))) "…")))))
 
-(defun madrigal-do--parse-action-response (text)
-  "Parse structured context-action response TEXT."
-  (let* ((object (json-parse-string
-                  (madrigal-do--json-response-text text)
-                  :object-type 'plist :array-type 'list
-                  :null-object nil :false-object nil))
-         (_ (madrigal-do--require-json-keys
-             object '(:result) "action response"))
-         (object (plist-get object :result)))
-    (cond
-     ((plist-member object :echo)
-      (madrigal-do--require-json-keys object '(:echo) "action result")
-      (list :kind 'echo
-            :content
-            (madrigal-do--brief-summary
-             (madrigal-do--suggestion-string object :echo))))
-     ((plist-member object :document)
-      (madrigal-do--require-json-keys object '(:document) "action result")
-      (let ((document (plist-get object :document)))
-        (madrigal-do--require-json-keys
-         document '(:name :content) "action document")
-        (let ((name (madrigal-do--suggestion-string document :name))
-              (content (plist-get document :content)))
-          (when (string-match-p "[\n\r]" name)
-            (error "Invalid Madrigal action document name"))
-          (unless (and (stringp content)
-                       (not (string-empty-p (string-trim content))))
-            (error "Invalid Madrigal action document content"))
-          (list :kind 'document :name name :content content))))
-     (t (error "Invalid Madrigal action response")))))
+(defun madrigal-do--response-title (action)
+  "Return a buffer title for ACTION's response."
+  (let ((response (or (madrigal-action-response action) ""))
+        (case-fold-search t))
+    (madrigal-do--brief-summary
+     (or (and (string-match "^#[+]title:[ \t]*\\(.+\\)$" response)
+              (match-string 1 response))
+         (and (string-match "^[*]+[ \t]+\\(.+\\)$" response)
+              (match-string 1 response))
+         (madrigal-action-instruction action)))))
 
 (defun madrigal-do--show-document (action)
   "Pop up ACTION's Org response in a read-only buffer."
-  (let ((buffer (generate-new-buffer
-                 (format "*Madrigal response: %s*"
-                         (madrigal-action-response-name action)))))
+  (let ((buffer
+         (generate-new-buffer
+          (format "*Madrigal response: %s*"
+                  (madrigal-do--response-title action)))))
     (with-current-buffer buffer
       (let ((inhibit-read-only t))
         (erase-buffer)
@@ -638,12 +597,19 @@ When KEEP-INDICATOR is non-nil, transfer its indicator to a selected action."
         (setq buffer-read-only t)))
     (pop-to-buffer buffer)))
 
+(defun madrigal-do--response-more-than-three-lines-p (text)
+  "Return non-nil when TEXT contains more than three logical lines."
+  (> (if (string-suffix-p "\n" text)
+         (cl-count ?\n text)
+       (1+ (cl-count ?\n text)))
+     3))
+
 (defun madrigal-do--show-result (action)
-  "Present ACTION's echo or Org document response."
-  (pcase (madrigal-action-response-kind action)
-    ('document (madrigal-do--show-document action))
-    (_ (message "Madrigal: %s"
-                (or (madrigal-action-response action) "Action completed.")))))
+  "Present ACTION's Org response in the echo area or an Org buffer."
+  (let ((response (or (madrigal-action-response action) "Action completed.")))
+    (if (madrigal-do--response-more-than-three-lines-p response)
+        (madrigal-do--show-document action)
+      (message "Madrigal: %s" response))))
 
 (defun madrigal-do--resolve-action (&optional action)
   "Return ACTION, the current eval action, or signal an error."
@@ -829,7 +795,6 @@ INDICATOR, when non-nil, is transferred from a DWIM suggestion request."
                   :agent madrigal-do-agent
                   :history (list (list :role 'user :content instruction))
                   :context (madrigal-context-render context)
-                  :response-format madrigal-do--action-response-schema
                   :environment (list :buffer buffer
                                      :request-id id
                                      :event-sink event-sink
@@ -852,17 +817,7 @@ INDICATOR, when non-nil, is transferred from a DWIM suggestion request."
                                  :kind (if final 'summary 'intermediate)
                                  :text text :final final :at (current-time)))))
                         (when final
-                          (condition-case parse-error
-                              (let ((response
-                                     (madrigal-do--parse-action-response text)))
-                                (setf (madrigal-action-response-kind action)
-                                      (plist-get response :kind)
-                                      (madrigal-action-response-name action)
-                                      (plist-get response :name)
-                                      (madrigal-action-response action)
-                                      (plist-get response :content)))
-                            (error
-                             (setf (madrigal-action-error action) parse-error)))))))
+                          (setf (madrigal-action-response action) text)))))
                   :on-finished
                   (lambda (_event)
                     (setf (madrigal-action-status action)
@@ -1636,6 +1591,23 @@ TIME-FUNCTION and STATUS-FUNCTION extract annotation data from each record."
   (madrigal-do--insert-elisp-data
    (madrigal-context-model-data context)))
 
+(defvar-local madrigal-do--history-refresh-function nil
+  "Function that refreshes the current Madrigal history buffer.")
+
+(defun madrigal-do--refresh-history-buffer ()
+  "Refresh the Madrigal history buffer at point."
+  (interactive)
+  (unless madrigal-do--history-refresh-function
+    (user-error "This is not a Madrigal history buffer"))
+  (funcall madrigal-do--history-refresh-function))
+
+(defun madrigal-do--configure-history-buffer (refresh-function)
+  "Configure the current history buffer to use REFRESH-FUNCTION."
+  (setq-local madrigal-do--history-refresh-function refresh-function)
+  (local-set-key (kbd "g") #'madrigal-do--refresh-history-buffer)
+  (local-set-key (kbd "q") #'quit-window)
+  (setq buffer-read-only t))
+
 (defun madrigal-do--render-history (action)
   "Render ACTION's turns and tool use in a read-only Org buffer."
   (let ((buffer (get-buffer-create
@@ -1661,8 +1633,8 @@ TIME-FUNCTION and STATUS-FUNCTION extract annotation data from each record."
           (dolist (event tools)
             (madrigal-do--insert-history-tool event)))
         (goto-char (point-min))
-        (local-set-key (kbd "q") #'quit-window)
-        (setq buffer-read-only t)))
+        (madrigal-do--configure-history-buffer
+         (lambda () (madrigal-do--render-history action)))))
     (display-buffer buffer)))
 
 (defun madrigal-do-history (&optional action)
@@ -1780,8 +1752,8 @@ TIME-FUNCTION and STATUS-FUNCTION extract annotation data from each record."
           (insert "* Error\n")
           (madrigal-do--insert-fixed-width (format "%s" error)))
         (goto-char (point-min))
-        (local-set-key (kbd "q") #'quit-window)
-        (setq buffer-read-only t)))
+        (madrigal-do--configure-history-buffer
+         (lambda () (madrigal-do--render-dwim-history request)))))
     (display-buffer buffer)))
 
 (defun madrigal-do-dwim-history (&optional request)
@@ -1849,8 +1821,8 @@ TIME-FUNCTION and STATUS-FUNCTION extract annotation data from each record."
            (madrigal-immediate-action-result operation)))
         (goto-char (point-min))
         (font-lock-ensure)
-        (local-set-key (kbd "q") #'quit-window)
-        (setq buffer-read-only t)))
+        (madrigal-do--configure-history-buffer
+         (lambda () (madrigal-do--render-immediate-history operation)))))
     (display-buffer buffer)))
 
 (defun madrigal-do-immediate-history (&optional operation)

@@ -1813,7 +1813,7 @@
                  "(point)"))
       (should (string-match-p ":value 4" callback-result)))))
 
-(ert-deftest madrigal-do-keeps-only-final-structured-response ()
+(ert-deftest madrigal-do-keeps-only-final-org-response ()
   (with-temp-buffer
     (let ((default-directory temporary-file-directory)
           (madrigal-do--active-actions nil)
@@ -1826,9 +1826,9 @@
                    (funcall (plist-get args :on-response)
                             '(:text "I will inspect first." :final nil))
                    (funcall (plist-get args :on-response)
-                            '(:text "{\"result\":{\"echo\":\"  Updated   the buffer.\\n\"}}"
-                              :final t))
+                            '(:text "Updated the buffer." :final t))
                    (funcall (plist-get args :on-finished) nil)
+                   (should-not (plist-member args :response-format))
                    (madrigal-agent-controller-handle-create
                     :provider 'provider :model "model"))))
         (let ((action (madrigal-do
@@ -1845,8 +1845,7 @@
                           (nth 2 (madrigal-action-turns action))))))))))
 
 (ert-deftest madrigal-do-displays-summary-only-in-minibuffer ()
-  (let ((action (madrigal-action-create
-                 :response-kind 'echo :response "Updated the buffer."))
+  (let ((action (madrigal-action-create :response "Updated the buffer."))
         displayed)
     (cl-letf (((symbol-function 'message)
                (lambda (format-string &rest args)
@@ -1854,26 +1853,21 @@
       (madrigal-do--show-result action))
     (should (equal "Madrigal: Updated the buffer." displayed))))
 
-(ert-deftest madrigal-do-parses-echo-and-document-responses ()
-  (should (equal '(:kind echo :content "Done")
-                 (madrigal-do--parse-action-response
-                  "{\"result\":{\"echo\":\"Done\"}}")))
-  (should (equal '(:kind document :name "Result" :content
-                   "#+title: Result\n\n* Details\nComplete")
-                 (madrigal-do--parse-action-response
-                  "{\"result\":{\"document\":{\"name\":\"Result\",\"content\":\"#+title: Result\\n\\n* Details\\nComplete\"}}}")))
-  (should (equal '(:kind document :name "Details" :content
-                   "* Details\nComplete")
-                 (madrigal-do--parse-action-response
-                  "{\"result\":{\"document\":{\"name\":\"Details\",\"content\":\"* Details\\nComplete\"}}}")))
-  (should-error
-   (madrigal-do--parse-action-response
-    "{\"result\":{\"echo\":\"Done\",\"document\":{\"name\":\"Details\",\"content\":\"* Details\"}}}")))
+(ert-deftest madrigal-do-routes-responses-longer-than-three-lines-to-a-buffer ()
+  (should-not (madrigal-do--response-more-than-three-lines-p "one\ntwo\nthree"))
+  (should-not (madrigal-do--response-more-than-three-lines-p "one\ntwo\nthree\n"))
+  (should (madrigal-do--response-more-than-three-lines-p
+           "one\ntwo\nthree\nfour"))
+  (let ((action (madrigal-action-create :response "one\ntwo\nthree\nfour"))
+        displayed)
+    (cl-letf (((symbol-function 'madrigal-do--show-document)
+               (lambda (value) (setq displayed value))))
+      (madrigal-do--show-result action))
+    (should (eq action displayed))))
 
 (ert-deftest madrigal-do-pops-read-only-org-document-with-quit-binding ()
   (let* ((action (madrigal-action-create
-                  :id "document-1" :response-kind 'document
-                  :response-name "Context changes"
+                  :id "document-1"
                   :response "#+title: Result\n\n* Details\nComplete"))
          displayed)
     (cl-letf (((symbol-function 'pop-to-buffer)
@@ -1881,14 +1875,30 @@
       (madrigal-do--show-result action))
     (unwind-protect
         (with-current-buffer displayed
-          (should (equal "*Madrigal response: Context changes*"
-                         (buffer-name)))
+          (should (equal "*Madrigal response: Result*" (buffer-name)))
           (should (derived-mode-p 'org-mode))
           (should buffer-read-only)
           (should (eq #'quit-window (key-binding (kbd "q"))))
           (should (equal "#+title: Result\n\n* Details\nComplete"
                          (buffer-string))))
       (kill-buffer displayed))))
+
+(ert-deftest madrigal-do-response-title-prefers-title-heading-then-prompt ()
+  (should (equal "Named report"
+                 (madrigal-do--response-title
+                  (madrigal-action-create
+                   :instruction "Fallback"
+                   :response "#+TITLE: Named report\n\n* Heading"))))
+  (should (equal "First heading"
+                 (madrigal-do--response-title
+                  (madrigal-action-create
+                   :instruction "Fallback"
+                   :response "Intro\n* First heading\nBody"))))
+  (should (equal "Explain the selection"
+                 (madrigal-do--response-title
+                  (madrigal-action-create
+                   :instruction "Explain the selection"
+                   :response "A response without a title.")))))
 
 (ert-deftest madrigal-do-history-default-retains-one-thousand-actions ()
   (should (= 1000 (default-value 'madrigal-do-history-length))))
@@ -1946,6 +1956,8 @@
             (should (derived-mode-p 'org-mode))
             (should buffer-read-only)
             (should (eq (key-binding (kbd "q")) #'quit-window))
+            (should (eq (key-binding (kbd "g"))
+                        #'madrigal-do--refresh-history-buffer))
             (should (string-match-p (regexp-quote "* User\nInspect this")
                                     (buffer-string)))
             (should (string-match-p (regexp-quote "** Response\nDone.")
@@ -1960,6 +1972,41 @@
         (kill-buffer buffer)))))
 
 
+
+(ert-deftest madrigal-do-history-refresh-renders-current-action-state ()
+  (let* ((action (madrigal-action-create
+                  :id "refresh-1" :instruction "Inspect"
+                  :turns (list (madrigal-action-turn-create
+                                :role 'user :text "Inspect"))))
+         buffer)
+    (unwind-protect
+        (cl-letf (((symbol-function 'display-buffer)
+                   (lambda (value &rest _) (setq buffer value))))
+          (madrigal-do--render-history action)
+          (setf (madrigal-action-turns action)
+                (append (madrigal-action-turns action)
+                        (list (madrigal-action-turn-create
+                               :role 'assistant :final t :text "Finished"))))
+          (with-current-buffer buffer
+            (call-interactively (key-binding (kbd "g")))
+            (should (string-match-p "Finished" (buffer-string)))))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
+
+(ert-deftest madrigal-do-dwim-history-binds-refresh ()
+  (let* ((request (madrigal-dwim-suggestion-request-create
+                   :id "dwim-refresh-1" :context '(:scope (:target session))
+                   :response "response"))
+         buffer)
+    (unwind-protect
+        (cl-letf (((symbol-function 'display-buffer)
+                   (lambda (value &rest _) (setq buffer value))))
+          (madrigal-do--render-dwim-history request)
+          (with-current-buffer buffer
+            (should (eq (key-binding (kbd "g"))
+                        #'madrigal-do--refresh-history-buffer))))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
 
 (ert-deftest madrigal-do-history-candidates-use-small-context-excerpts ()
   (with-temp-buffer
@@ -2085,51 +2132,6 @@
         (when-let* ((property
                      (plist-get (plist-get alternative :properties) field)))
           (should-not (plist-member property :maxLength)))))))
-
-(ert-deftest madrigal-do-response-schemas-have-no-string-length-limits ()
-  (let* ((result (plist-get madrigal-do--action-response-schema :properties))
-         (alternatives
-          (append
-           (plist-get (plist-get result :result) :anyOf) nil)))
-    (dolist (alternative alternatives)
-      (cl-labels ((has-max-length-p
-                   (value)
-                   (cond
-                    ((consp value)
-                     (or (eq (car value) :maxLength)
-                         (seq-some #'has-max-length-p value)))
-                    ((vectorp value) (seq-some #'has-max-length-p value)))))
-        (should-not (has-max-length-p alternative))))))
-
-(ert-deftest madrigal-do-response-schemas-describe-org-mode-fields ()
-  (let* ((action-alternatives
-          (append
-           (plist-get
-            (plist-get (plist-get madrigal-do--action-response-schema :properties)
-                       :result)
-            :anyOf)
-           nil))
-         (document-properties
-          (plist-get
-           (plist-get (plist-get (cadr action-alternatives) :properties)
-                      :document)
-           :properties))
-         (suggestion-items
-          (plist-get
-           (plist-get
-            (plist-get madrigal-do--suggestion-response-schema :properties)
-            :suggestions)
-           :items))
-         (suggestion-alternatives
-          (append (plist-get suggestion-items :anyOf) nil)))
-    (should (equal "An Org mode document body."
-                   (plist-get (plist-get document-properties :content)
-                              :description)))
-    (should (equal "An Org mode description of the action."
-                   (plist-get
-                    (plist-get (plist-get (cadr suggestion-alternatives) :properties)
-                               :action-description)
-                    :description)))))
 
 (ert-deftest madrigal-do-accepts-unbounded-prompt-and-source-suggestions ()
   (let* ((prompt (make-string 501 ?p))
@@ -2334,6 +2336,8 @@
           (should (derived-mode-p 'org-mode))
           (should buffer-read-only)
           (should (eq #'quit-window (key-binding (kbd "q"))))
+          (should (eq #'madrigal-do--refresh-history-buffer
+                      (key-binding (kbd "g"))))
           (should (string-match-p "Insert text" (buffer-string)))
           (should (string-match-p "(insert \\\"ok\\\")" (buffer-string)))
           (should (string-match-p "ok" (buffer-string))))
@@ -2410,9 +2414,12 @@
            ("do-dwim" . ("Provider" . "fast-model")))))
     (should (equal "do-dwim" (madrigal-do--dwim-model-agent)))))
 
-(ert-deftest madrigal-do-system-prompt-requires-org-document-content ()
+(ert-deftest madrigal-do-system-prompt-requires-a-raw-org-response ()
   (should (string-match-p
-           (regexp-quote "document content field MUST use Org mode formatting")
+           (regexp-quote "return only the raw Org mode body")
+           madrigal--do-system-prompt))
+  (should (string-match-p
+           (regexp-quote "Emacs chooses and names any response buffer")
            madrigal--do-system-prompt)))
 
 (ert-deftest madrigal-do-suggestion-prompt-always-requests-json-schema ()
