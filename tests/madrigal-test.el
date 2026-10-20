@@ -1922,12 +1922,32 @@
     (unwind-protect
         (with-current-buffer displayed
           (should (equal "*Madrigal response: Result*" (buffer-name)))
+          (should (eq major-mode 'madrigal-do-result-mode))
           (should (derived-mode-p 'org-mode))
           (should buffer-read-only)
           (should (eq #'quit-window (key-binding (kbd "q"))))
           (should (equal "#+title: Result\n\n* Details\nComplete"
                          (buffer-string))))
       (kill-buffer displayed))))
+
+(ert-deftest madrigal-do-buffer-keybindings-do-not-change-org-mode-map ()
+  (let ((org-map-q (lookup-key org-mode-map (kbd "q")))
+        (org-map-g (lookup-key org-mode-map (kbd "g")))
+        org-g)
+    (with-temp-buffer
+      (org-mode)
+      (setq org-g (key-binding (kbd "g"))))
+    (with-temp-buffer
+      (madrigal-do-result-mode)
+      (should (eq #'quit-window (key-binding (kbd "q"))))
+      (should (equal org-g (key-binding (kbd "g")))))
+    (with-temp-buffer
+      (madrigal-do-history-mode)
+      (should (eq #'quit-window (key-binding (kbd "q"))))
+      (should (eq #'madrigal-do--refresh-history-buffer
+                  (key-binding (kbd "g")))))
+    (should (equal org-map-q (lookup-key org-mode-map (kbd "q"))))
+    (should (equal org-map-g (lookup-key org-mode-map (kbd "g"))))))
 
 (ert-deftest madrigal-do-promotes-a-fully-fenced-org-response ()
   (should (equal "#+title: Result\n\n* Details\nComplete"
@@ -2025,6 +2045,7 @@
                    (lambda (value &rest _) (setq buffer value))))
           (madrigal-do-history action)
           (with-current-buffer buffer
+            (should (eq major-mode 'madrigal-do-history-mode))
             (should (derived-mode-p 'org-mode))
             (should buffer-read-only)
             (should (eq (key-binding (kbd "q")) #'quit-window))
@@ -2428,6 +2449,7 @@
       (madrigal-do-immediate-history operation))
     (unwind-protect
         (with-current-buffer displayed
+          (should (eq major-mode 'madrigal-do-history-mode))
           (should (derived-mode-p 'org-mode))
           (should buffer-read-only)
           (should (eq #'quit-window (key-binding (kbd "q"))))

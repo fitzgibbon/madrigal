@@ -46,6 +46,23 @@ that accent over the default background at separate context and point strengths.
   :type '(repeat face)
   :group 'madrigal)
 
+(defvar-keymap madrigal-do-result-mode-map
+  :doc "Keymap for Madrigal result buffers."
+  :parent org-mode-map
+  "q" #'quit-window)
+
+(define-derived-mode madrigal-do-result-mode org-mode "Madrigal Result"
+  "Major mode for read-only Madrigal result buffers.")
+
+(defvar-keymap madrigal-do-history-mode-map
+  :doc "Keymap for Madrigal history buffers."
+  :parent madrigal-do-result-mode-map
+  "g" #'madrigal-do--refresh-history-buffer)
+
+(define-derived-mode madrigal-do-history-mode madrigal-do-result-mode
+  "Madrigal History"
+  "Major mode for read-only Madrigal history buffers.")
+
 
 (cl-defstruct (madrigal-tool-event
                (:constructor madrigal-tool-event-create))
@@ -600,11 +617,10 @@ When KEEP-INDICATOR is non-nil, transfer its indicator to a selected action."
     (with-current-buffer buffer
       (let ((inhibit-read-only t))
         (erase-buffer)
-        (org-mode)
+        (madrigal-do-result-mode)
         (insert (madrigal-action-response action))
         (goto-char (point-min))
         (font-lock-ensure)
-        (local-set-key (kbd "q") #'quit-window)
         (setq buffer-read-only t)))
     (pop-to-buffer buffer)))
 
@@ -1672,8 +1688,6 @@ TIME-FUNCTION and STATUS-FUNCTION extract annotation data from each record."
 (defun madrigal-do--configure-history-buffer (refresh-function)
   "Configure the current history buffer to use REFRESH-FUNCTION."
   (setq-local madrigal-do--history-refresh-function refresh-function)
-  (local-set-key (kbd "g") #'madrigal-do--refresh-history-buffer)
-  (local-set-key (kbd "q") #'quit-window)
   (setq buffer-read-only t))
 
 (defun madrigal-do--render-history (action)
@@ -1683,7 +1697,7 @@ TIME-FUNCTION and STATUS-FUNCTION extract annotation data from each record."
     (with-current-buffer buffer
       (let ((inhibit-read-only t))
         (erase-buffer)
-        (org-mode)
+        (madrigal-do-history-mode)
         (insert (format "#+title: Madrigal action %s\n\n" (madrigal-action-id action)))
         (madrigal-do--insert-history-system-context
          (when-let* ((handle (madrigal-action-handle action)))
@@ -1764,7 +1778,7 @@ TIME-FUNCTION and STATUS-FUNCTION extract annotation data from each record."
     (with-current-buffer buffer
       (let ((inhibit-read-only t))
         (erase-buffer)
-        (org-mode)
+        (madrigal-do-history-mode)
         (insert (format "#+title: Madrigal DWIM suggestion %s\n\n"
                         (madrigal-dwim-suggestion-request-id request)))
         (madrigal-do--insert-history-system-context
@@ -1833,7 +1847,7 @@ TIME-FUNCTION and STATUS-FUNCTION extract annotation data from each record."
     (with-current-buffer buffer
       (let ((inhibit-read-only t))
         (erase-buffer)
-        (org-mode)
+        (madrigal-do-history-mode)
         (insert (format "#+title: Madrigal immediate action %s\n\n"
                         (madrigal-immediate-action-id operation)))
         (insert "* Action\n")
